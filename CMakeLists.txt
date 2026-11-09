@@ -10,6 +10,7 @@ add_library(picanative STATIC
   src/color.cpp
   src/pica.cpp
   src/trace.cpp
+  src/shadergen_vertex.cpp
   src/transfer.cpp
   src/vertex.cpp
 )
@@ -20,10 +21,29 @@ else ()
   target_compile_options(picanative PRIVATE -Wall -Wextra)
 endif ()
 
+# GPU layer: Dawn (WebGPU), found as Aurora ships it (a prebuilt install tree,
+# https://github.com/encounter/dawn-build), through CMAKE_PREFIX_PATH or Dawn_DIR.
+find_package(Dawn CONFIG REQUIRED)
+add_library(picanative_gpu STATIC src/gpu.cpp)
+target_include_directories(picanative_gpu PUBLIC include)
+target_link_libraries(picanative_gpu PUBLIC picanative dawn::webgpu_dawn)
+
+# the tools run next to Dawn's libraries
+function(picanative_copy_dawn target)
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:${target}> $<TARGET_FILE_DIR:${target}>
+    COMMAND_EXPAND_LISTS)
+endfunction()
+
 option(PICANATIVE_TOOLS "Build the test tools" ON)
 if (PICANATIVE_TOOLS)
   add_executable(pn_optest tools/optest.cpp)
   target_link_libraries(pn_optest PRIVATE picanative)
   add_executable(pn_state tools/state.cpp)
   target_link_libraries(pn_state PRIVATE picanative)
+  add_executable(pn_shadertest tools/shadertest.cpp)
+  target_link_libraries(pn_shadertest PRIVATE picanative_gpu)
+  if (WIN32)
+    picanative_copy_dawn(pn_shadertest)
+  endif ()
 endif ()
