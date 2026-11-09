@@ -157,6 +157,7 @@ int main(int argc, char** argv) {
   std::printf("%u frames in %.1f s: %llu draws (%llu skipped), %llu pipelines, %llu shader errors, %llu textures, %llu passes\n",
               frame, seconds, (unsigned long long)s.draws, (unsigned long long)s.skipped, (unsigned long long)s.pipelines,
               (unsigned long long)s.shader_errors, (unsigned long long)s.textures_decoded, (unsigned long long)s.passes);
+  std::printf("%llu distinct vertex shaders among the pipelines\n", (unsigned long long)s.vertex_modules);
   std::printf("time: record %.1f s (textures %.1f, pipelines %.1f), encode %.1f, GPU wait + store %.1f (store %.1f), load %.1f\n",
               s.record, s.textures, s.pipelines_time, s.encode, s.wait, s.store, s.load);
   if (compared) std::printf("average PSNR over %u screens: %.1f dB\n", compared, total_psnr / compared);

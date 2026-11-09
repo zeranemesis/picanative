@@ -253,6 +253,8 @@ Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool 
 Renderer::~Renderer() = default;
 
 void Renderer::command_list(uint32_t address, uint32_t size) {
+  // pipelines finished compiling since
+  if (async_) gpu_.instance.ProcessEvents();
   // the CPU may have changed textures since the last list unless the host
   // reports its writes; within a list it cannot
   if (!trusted_) known_.clear();
@@ -477,6 +479,10 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
   std::string id(reinterpret_cast<const char*>(key.data()), key.size() * 4);
   auto found = pipelines_.find(id);
   if (found != pipelines_.end()) return found->second;
+  if (compiling_.count(id)) {
+    ++stats_.waiting;
+    return nullptr;
+  }
   ++stats_.pipelines;
   Timed timed{stats_.pipelines_time};
   const std::string vertex_source = draw::vertex_wgsl(c, vs), fragment_source = draw::fragment_wgsl(c);
@@ -484,6 +490,7 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
   wgpu::RenderPipeline result;
   const std::string error = gpu::checked(gpu_, [&] {
     // a module per source, shared by the pipelines that use it
+    if (!modules_.count(vertex_source)) ++stats_.vertex_modules;
     auto shared = [&](const std::string& text) {
       auto& slot = modules_[text];
       if (!slot) slot = module(gpu_, text);
@@ -543,8 +550,29 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
       ds.stencilWriteMask = 0;
     }
     pd.depthStencil = &ds;
-    result = gpu_.device.CreateRenderPipeline(&pd);
+    if (!async_) {
+      result = gpu_.device.CreateRenderPipeline(&pd);
+      return;
+    }
+    // compiled on Dawn's threads: the draws that need it wait (are skipped)
+    // until it is ready, and the game goes on meanwhile
+    compiling_.insert(id);
+    gpu_.device.CreateRenderPipelineAsync(
+        &pd, wgpu::CallbackMode::AllowProcessEvents,
+        [this, id, source](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline ready, wgpu::StringView message) {
+          compiling_.erase(id);
+          if (status != wgpu::CreatePipelineAsyncStatus::Success) {
+            ++stats_.shader_errors;
+            if (errors.size() < 3)
+              errors.push_back(std::string(message.data, message.length) + "\n--- WGSL ---\n" + source);
+          }
+          pipelines_[id] = std::move(ready);
+        });
   });
+  if (async_ && error.empty()) {
+    ++stats_.waiting;
+    return nullptr;
+  }
   if (!error.empty()) {
     ++stats_.shader_errors;
     if (errors.size() < 3) errors.push_back(error + "\n--- WGSL ---\n" + source);

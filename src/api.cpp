@@ -48,6 +48,7 @@ pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, 
   }
   engine->renderer = std::make_unique<Renderer>(engine->gpu, engine->memory, (flags & PN_CACHE_SURFACES) != 0,
                                                 (flags & PN_TRUST_CPU_WRITES) != 0);
+  engine->renderer->set_async_pipelines((flags & PN_ASYNC_PIPELINES) != 0);
   return engine.release();
 }
 

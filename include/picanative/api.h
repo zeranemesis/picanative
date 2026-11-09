@@ -51,6 +51,9 @@ PN_API void pn_cpu_wrote(pn_engine* engine, uint32_t address, uint32_t size);
    host reports every CPU write). 0, the default, is safe with any host. */
 #define PN_CACHE_SURFACES 1u
 #define PN_TRUST_CPU_WRITES 2u
+/* pipelines compile on other threads, draws waiting for one are skipped:
+   no stall the first time a shader is met (the disk cache makes it once) */
+#define PN_ASYNC_PIPELINES 4u
 PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, uint32_t error_size);
 
 /* counters, for a status line: draws, pipelines, shader errors */

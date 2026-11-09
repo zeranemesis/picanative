@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -54,11 +55,16 @@ public:
 
   struct Stats {
     uint64_t draws = 0, skipped = 0, passes = 0, pipelines = 0, textures_decoded = 0, flushes = 0;
-    uint64_t shader_errors = 0;
+    uint64_t shader_errors = 0, vertex_modules = 0, waiting = 0; // waiting: draws skipped while their pipeline compiles
     // where the time goes, in seconds
     double record = 0, textures = 0, pipelines_time = 0, encode = 0, wait = 0, load = 0, store = 0;
   };
   const Stats& stats() const { return stats_; }
+
+  // Pipelines compile on other threads, and draws needing one that is not
+  // ready yet are skipped (for a game: no stall; tools comparing pictures
+  // keep the default, compiling as it goes).
+  void set_async_pipelines(bool on) { async_ = on; }
 
   // the first WGSL compile errors, for diagnosis
   std::vector<std::string> errors;
@@ -88,6 +94,8 @@ private:
   gpu::Context& gpu_;
   Memory& memory_;
   bool cached_, trusted_;
+  bool async_ = false;
+  std::set<std::string> compiling_;
   pica::CommandProcessor processor_;
   Stats stats_;
 
