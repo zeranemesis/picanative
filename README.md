@@ -10,8 +10,9 @@ la couche GameCube des ports décompilés.
 Premier client : le port natif de Super Mario 3D Land, sur PC et sur l'AYN
 Thor.
 
-**État : G1 fait** (opérations mémoire exactes). L'architecture et les étapes sont dans
-[DESIGN.md](DESIGN.md). Le rendu des listes de commandes (G2) commence.
+**État : le moteur rend Super Mario 3D Land sur PC**, du démarrage au niveau 1-1,
+comparé image par image à une implémentation de référence (voir les étapes dans
+[DESIGN.md](DESIGN.md)). Reste : la Thor (Android) et la fenêtre SDL3 propre au port.
 
 ## Principes
 
@@ -39,8 +40,12 @@ MIT, voir [LICENSE](LICENSE).
 ## Compiler
 
 ```
-cmake -S . -B build
+cmake -S . -B build -DCMAKE_PREFIX_PATH=<paquet Dawn précompilé, celui d'Aurora>
 cmake --build build --config Release
 build/Release/pn_optest <dossier de cas .pncase>
 build/Release/pn_state <trace.pntrace> [états.txt] [dessins.txt]
+build/Release/pn_shadertest <dossier de cas .pnvs>
+build/Release/pn_texturetest <dossier de cas .pntx>
+build/Release/pn_render [--cached] <trace.pntrace> [dossier d'images]
+build/Release/pn_stats <trace.pntrace>
 ```

@@ -1,4 +1,4 @@
-# picanative — conception
+# picanative — conception et état
 
 Décidé le 9 novembre 2026 : le port de Super Mario 3D Land a **son propre moteur de rendu**, écrit
 pour lui, le plus rapide et le plus modulaire possible. `zakuro-gpu` n'en fait
@@ -92,12 +92,12 @@ Aucun module n'est déclaré fini sans comparaison automatique.
 
 | Étape | Contenu | Jalon vérifiable |
 |---|---|---|
-| G0 | `trace/` : enregistreur dans l'échafaudage, relecteur, comparateur d'images | traces des 6 scènes de référence, relues à l'identique dans `zakuro-gpu` |
+| G0 | traces : enregistreur dans l'échafaudage, relecteur de référence, comparateur | **fait** : trace du démarrage au 1-1 (6 000 images), 40/40 écrans identiques en relecture |
 | G1 | effacements, transferts d'écran et copies de texture, exacts sur le processeur (`src/transfer.cpp`) : la référence des versions GPU du cache de surfaces | **fait** : 13 cas sur 13 tirés de la trace (toutes les familles qu'utilise le jeu jusqu'au 1-1) identiques octet par octet |
-| G2 | `pica/` (registres, listes de commandes), `vertex/`, shaders de sommets → WGSL, TEV de base, textures courantes, `gpu/` et `present/` (fenêtre SDL3, deux écrans) | les dialogues 2D de l'écran du bas, puis le logo et l'écran titre en 3D ; **fait** : `pica/` (registres, paquets de mots, sauts entre listes, programmes et uniformes de shaders, tables) — l'état du GPU est identique à la référence aux 6 000 fins d'image du démarrage au 1-1 (2 593 états différents) ; **fait** : `vertex/` (tableaux d'attributs, index, attributs fixes, permutation des entrées) — les entrées du shader de sommets sont identiques à la référence pour les 828 072 dessins du démarrage au 1-1 |
-| G3 | TEV complet, tous les formats de texture, éclairage par fragment, brouillard, blending, stencil | cinématique et carte du monde |
-| G4 | cache de surfaces complet (rendu vers texture), cas rares | le 1-1 entier identique à la référence |
-| G5 | branchement dans l'hôte à la place de `zakuro-gpu`, puis la Thor | 1-1 jouable sur PC, puis sur la Thor |
+| G2 | `pica/` (registres, listes de commandes), `vertex/`, shaders de sommets → WGSL, couche Dawn | **fait** : état du GPU identique à la référence aux 6 000 fins d'image ; entrées de sommets identiques pour les 828 072 dessins ; 27/27 cas de shaders (tous les programmes du jeu) exécutés sur GPU à 2,3e-6 près |
+| G3 | textures (14 formats), TEV, éclairage par fragment, brouillard, mélange, stencil, profondeur 24 bits, moteur de dessin | **fait** : 70/70 cas de textures ; trace du démarrage au 1-1 rendue par picanative : 40 écrans, au plus 0,11 % des pixels écartés de plus de 16, PSNR moyen 64,9 dB, 0 dessin sauté, 0 erreur de shader |
+| G4 | cache de surfaces, clears GPU, cache de textures, cache disque des pipelines, compilation asynchrone | **fait** : mêmes 40 écrans ; trace complète 820 s → 133 s avec le cache disque rempli (environ 45 images/s) |
+| G5 | branchement dans l'hôte à la place de `zakuro-gpu`, puis la Thor | **PC fait** : le jeu tourne du titre au 1-1 rendu par picanative (DLL + API C, aiguillage dans l'échafaudage) ; Thor : à faire (Dawn Android présent, NDK absent de la machine) |
 
 ## Modèle : Aurora
 
