@@ -42,4 +42,5 @@ MIT, voir [LICENSE](LICENSE).
 cmake -S . -B build
 cmake --build build --config Release
 build/Release/pn_optest <dossier de cas .pncase>
+build/Release/pn_state <trace.pntrace> [empreintes.txt]
 ```

@@ -8,6 +8,7 @@
 //
 // usage: pn_optest <directory of .pncase>
 
+#include "picanative/host_memory.hpp"
 #include "picanative/transfer.hpp"
 
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,20 +25,6 @@ using namespace picanative;
 
 namespace {
 
-class CaseMemory final : public Memory {
-public:
-  CaseMemory() : vram_(kVramSize), fcram_(0x10000000) {}
-  uint8_t* map(uint32_t address, uint32_t size) override {
-    if (address >= kVramBase && uint64_t{address} + size <= uint64_t{kVramBase} + vram_.size())
-      return &vram_[address - kVramBase];
-    if (address >= kFcramBase && uint64_t{address} + size <= uint64_t{kFcramBase} + fcram_.size())
-      return &fcram_[address - kFcramBase];
-    return nullptr;
-  }
-
-private:
-  std::vector<uint8_t> vram_, fcram_;
-};
 
 struct Zone {
   uint32_t address, size;
@@ -84,7 +72,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "usage: pn_optest <directory of .pncase>\n");
     return 2;
   }
-  CaseMemory memory;
+  auto owned = std::make_unique<HostMemory>();
+  HostMemory& memory = *owned;
   std::map<std::string, std::pair<int, int>> totals; // family -> passed, total
   int failed = 0;
   std::vector<std::filesystem::path> files;

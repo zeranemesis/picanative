@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Engine core: pure modules, no graphics API (see DESIGN.md).
 add_library(picanative STATIC
   src/color.cpp
+  src/pica.cpp
+  src/trace.cpp
   src/transfer.cpp
 )
 target_include_directories(picanative PUBLIC include)
@@ -21,4 +23,6 @@ option(PICANATIVE_TOOLS "Build the test tools" ON)
 if (PICANATIVE_TOOLS)
   add_executable(pn_optest tools/optest.cpp)
   target_link_libraries(pn_optest PRIVATE picanative)
+  add_executable(pn_state tools/state.cpp)
+  target_link_libraries(pn_state PRIVATE picanative)
 endif ()
