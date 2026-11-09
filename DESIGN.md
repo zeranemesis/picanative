@@ -93,8 +93,8 @@ Aucun module n'est déclaré fini sans comparaison automatique.
 | Étape | Contenu | Jalon vérifiable |
 |---|---|---|
 | G0 | `trace/` : enregistreur dans l'échafaudage, relecteur, comparateur d'images | traces des 6 scènes de référence, relues à l'identique dans `zakuro-gpu` |
-| G1 | `gx/`, `pica/`, `gpu/` de base, `present/` ; MemoryFill, DisplayTransfer, TextureCopy | les dialogues 2D de l'écran du bas identiques à la référence |
-| G2 | `vertex/`, shaders de sommets → SPIR-V, TEV de base, textures courantes | logo et écran titre en 3D |
+| G1 | effacements, transferts d'écran et copies de texture, exacts sur le processeur (`src/transfer.cpp`) : la référence des versions GPU du cache de surfaces | **fait** : 13 cas sur 13 tirés de la trace (toutes les familles qu'utilise le jeu jusqu'au 1-1) identiques octet par octet |
+| G2 | `pica/` (registres, listes de commandes), `vertex/`, shaders de sommets → WGSL, TEV de base, textures courantes, `gpu/` et `present/` (fenêtre SDL3, deux écrans) | les dialogues 2D de l'écran du bas, puis le logo et l'écran titre en 3D |
 | G3 | TEV complet, tous les formats de texture, éclairage par fragment, brouillard, blending, stencil | cinématique et carte du monde |
 | G4 | cache de surfaces complet (rendu vers texture), cas rares | le 1-1 entier identique à la référence |
 | G5 | branchement dans l'hôte à la place de `zakuro-gpu`, puis la Thor | 1-1 jouable sur PC, puis sur la Thor |

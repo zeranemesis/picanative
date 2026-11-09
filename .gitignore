@@ -3,3 +3,4 @@ out/
 # traces et images enregistrées depuis un jeu : jamais dans ce dépôt
 *.pntrace
 traces/
+build/

@@ -10,8 +10,8 @@ la couche GameCube des ports décompilés.
 Premier client : le port natif de Super Mario 3D Land, sur PC et sur l'AYN
 Thor.
 
-**État : conception.** L'architecture et les étapes sont dans
-[DESIGN.md](DESIGN.md). Aucun module n'est encore écrit.
+**État : G1 fait** (opérations mémoire exactes). L'architecture et les étapes sont dans
+[DESIGN.md](DESIGN.md). Le rendu des listes de commandes (G2) commence.
 
 ## Principes
 
@@ -35,3 +35,11 @@ tests mais restent chez celui qui les enregistre, à partir de sa propre copie.
 ## Licence
 
 MIT, voir [LICENSE](LICENSE).
+
+## Compiler
+
+```
+cmake -S . -B build
+cmake --build build --config Release
+build/Release/pn_optest <dossier de cas .pncase>
+```
