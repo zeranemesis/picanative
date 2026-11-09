@@ -11,6 +11,7 @@ add_library(picanative STATIC
   src/pica.cpp
   src/trace.cpp
   src/shadergen_vertex.cpp
+  src/texture.cpp
   src/transfer.cpp
   src/vertex.cpp
 )
@@ -40,6 +41,10 @@ if (PICANATIVE_TOOLS)
   add_executable(pn_optest tools/optest.cpp)
   target_link_libraries(pn_optest PRIVATE picanative)
   add_executable(pn_state tools/state.cpp)
+  add_executable(pn_texturetest tools/texturetest.cpp)
+  target_link_libraries(pn_texturetest PRIVATE picanative)
+  add_executable(pn_stats tools/stats.cpp)
+  target_link_libraries(pn_stats PRIVATE picanative)
   target_link_libraries(pn_state PRIVATE picanative)
   add_executable(pn_shadertest tools/shadertest.cpp)
   target_link_libraries(pn_shadertest PRIVATE picanative_gpu)
