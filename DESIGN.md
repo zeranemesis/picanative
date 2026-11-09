@@ -40,14 +40,14 @@ shadergen/   état décodé -> shaders :
 texture/     décodage des 14 formats PICA (tuilés, ETC1/ETC1A4), cache par empreinte
 surface/     cache des surfaces : rendu, profondeur, textures et écrans qui
              partagent la mémoire vidéo ; copie en mémoire du jeu seulement à la demande
-rhi/         petite interface de rendu (pipelines, tampons, images, passes)
-rhi_vulkan/  son implémentation Vulkan (Windows et Android)
+gpu/         WebGPU (Dawn) : appareil, cache de pipelines, fil de rendu ;
+             D3D12 ou Vulkan sur Windows, Vulkan sur Android
 present/     les deux écrans : disposition, mise à l'échelle, 3D stéréo plus tard
 trace/       enregistrement et relecture des entrées ci-dessus, image par image
 ```
 
-Les modules ne connaissent que leurs voisins directs. On peut changer de rendu
-(Vulkan, puis un autre) sans toucher à `pica/` ni à `shadergen/`, et tester
+Les modules ne connaissent que leurs voisins directs. Le choix de l'API graphique
+(D3D12, Vulkan, Metal) est celui de Dawn : il ne touche ni `pica/` ni `shadergen/`, et tester
 `shadergen/` ou `texture/` sans écran.
 
 ## Choix pour la vitesse
@@ -57,16 +57,18 @@ Les modules ne connaissent que leurs voisins directs. On peut changer de rendu
    fois et gardés dans un cache sur disque (local, jamais publié). En jeu, on ne
    compile que ce qui manque, en arrière-plan, sans à-coups. Un shader de
    secours générique couvre l'attente.
-2. **SPIR-V produit directement** par `shadergen/`, sans passer par GLSL ni
-   par un compilateur de shaders au lancement : c'est important sur la Thor.
+2. **WGSL produit par `shadergen/`**, compilé par Dawn pour l'API de la
+   machine, comme le fait Aurora. Le cache de pipelines est « transférable » :
+   celui construit sur nos traces peut accompagner le port, et la Thor ne
+   compile presque rien au lancement.
 3. **État haché une fois par dessin** : pipeline, descripteurs et textures sont
    retrouvés par empreinte, jamais reconstruits si rien n'a changé.
 4. **Pas de retour GPU → processeur** pendant l'image, sauf si le jeu lit
    vraiment la mémoire d'une surface. Le cache de surfaces le sait.
 5. **Textures décodées sur le GPU** (calcul) pour les gros formats, mises en
    cache par empreinte de leur mémoire.
-6. **Enregistrement des commandes Vulkan sur un fil séparé** du jeu, une image
-   d'avance au plus.
+6. **Encodage des commandes GPU sur un fil de rendu séparé** du jeu, une image
+   d'avance au plus, comme le `render_worker` d'Aurora.
 7. Résolution interne réglable, 1× à 4× et plus : le jeu dessine en 400×240,
    le moteur peut dessiner plus fin.
 
@@ -91,15 +93,36 @@ Aucun module n'est déclaré fini sans comparaison automatique.
 | Étape | Contenu | Jalon vérifiable |
 |---|---|---|
 | G0 | `trace/` : enregistreur dans l'échafaudage, relecteur, comparateur d'images | traces des 6 scènes de référence, relues à l'identique dans `zakuro-gpu` |
-| G1 | `gx/`, `pica/`, `rhi_vulkan/` de base, `present/` ; MemoryFill, DisplayTransfer, TextureCopy | les dialogues 2D de l'écran du bas identiques à la référence |
+| G1 | `gx/`, `pica/`, `gpu/` de base, `present/` ; MemoryFill, DisplayTransfer, TextureCopy | les dialogues 2D de l'écran du bas identiques à la référence |
 | G2 | `vertex/`, shaders de sommets → SPIR-V, TEV de base, textures courantes | logo et écran titre en 3D |
 | G3 | TEV complet, tous les formats de texture, éclairage par fragment, brouillard, blending, stencil | cinématique et carte du monde |
 | G4 | cache de surfaces complet (rendu vers texture), cas rares | le 1-1 entier identique à la référence |
 | G5 | branchement dans l'hôte à la place de `zakuro-gpu`, puis la Thor | 1-1 jouable sur PC, puis sur la Thor |
 
+## Modèle : Aurora
+
+[Aurora](https://github.com/encounter/aurora) (MIT) est la couche de
+compatibilité GameCube et Wii des ports décompilés : Metaforce, Dusklight,
+Mario Party 4 et 6, Super Mario Sunshine. `picanative` suit son architecture
+et sa pile, adaptées du GX au PICA200 :
+
+| Aurora | picanative |
+|---|---|
+| SDL3 pour la fenêtre, les entrées et Android | pareil |
+| Dawn / WebGPU : D3D12, Vulkan, Metal | pareil (`gpu/`) |
+| `gx/command_processor` : lit les listes d'affichage GX | `pica/` : lit les listes de commandes PICA |
+| `gx/shader` : état GX → WGSL | `shadergen/` : shaders PICA et TEV → WGSL |
+| `gfx/pipeline_cache` : cache transférable, compilation asynchrone | pareil |
+| `gfx/render_worker` : encodage sur un fil séparé | pareil |
+| `gfx/texture_convert` : formats GameCube | `texture/` : formats PICA, ETC1 |
+| `gfx/tex_copy_conv` : copies EFB vers texture | `surface/` : rendu vers texture, DisplayTransfer |
+
+Le code générique d'Aurora (appareil Dawn, cache de pipelines, fil de rendu)
+peut être repris en le créditant. Ce qui est propre au PICA200 est écrit ici.
+
 ## Ce qu'on reprend, ce qu'on écrit
 
 Le comportement du PICA200 est documenté par la communauté (3dbrew) et par les
 émulateurs. `zakuro-gpu` est sous licence MIT : on peut s'y référer pour un
-détail matériel et reprendre une table en le créditant. L'architecture, le code
-et les choix de performance sont les nôtres.
+détail matériel et reprendre une table en le créditant ; il sert surtout de
+référence de comparaison. L'architecture suit Aurora.
