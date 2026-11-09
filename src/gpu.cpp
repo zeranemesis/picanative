@@ -42,7 +42,13 @@ bool create(Context& context, std::string& error, wgpu::BackendType backend) {
   context.adapter_name = std::string(info.device.data, info.device.length);
   context.backend = info.backendType;
 
+  // depth and stencil the engine copies to and from the game's memory
+  std::vector<wgpu::FeatureName> features_wanted;
+  if (context.adapter.HasFeature(wgpu::FeatureName::Depth32FloatStencil8))
+    features_wanted.push_back(wgpu::FeatureName::Depth32FloatStencil8);
   wgpu::DeviceDescriptor device_descriptor{};
+  device_descriptor.requiredFeatureCount = features_wanted.size();
+  device_descriptor.requiredFeatures = features_wanted.data();
   device_descriptor.SetUncapturedErrorCallback(
       [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView message) {
         std::fprintf(stderr, "WebGPU error %d: %.*s\n", static_cast<int>(type), static_cast<int>(message.length),
