@@ -254,7 +254,12 @@ Renderer::~Renderer() = default;
 
 void Renderer::command_list(uint32_t address, uint32_t size) {
   // pipelines finished compiling since
-  if (async_) gpu_.instance.ProcessEvents();
+  if (async_) {
+    // pipelines that finished compiling since, without waiting for the others
+    for (auto it = futures_.begin(); it != futures_.end();)
+      if (gpu_.instance.WaitAny(*it, 0) == wgpu::WaitStatus::Success) it = futures_.erase(it);
+      else ++it;
+  }
   // the CPU may have changed textures since the last list unless the host
   // reports its writes; within a list it cannot
   if (!trusted_) known_.clear();
@@ -557,8 +562,8 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
     // compiled on Dawn's threads: the draws that need it wait (are skipped)
     // until it is ready, and the game goes on meanwhile
     compiling_.insert(id);
-    gpu_.device.CreateRenderPipelineAsync(
-        &pd, wgpu::CallbackMode::AllowProcessEvents,
+    futures_.push_back(gpu_.device.CreateRenderPipelineAsync(
+        &pd, wgpu::CallbackMode::WaitAnyOnly,
         [this, id, source](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline ready, wgpu::StringView message) {
           compiling_.erase(id);
           if (status != wgpu::CreatePipelineAsyncStatus::Success) {
@@ -567,9 +572,13 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
               errors.push_back(std::string(message.data, message.length) + "\n--- WGSL ---\n" + source);
           }
           pipelines_[id] = std::move(ready);
-        });
+        }));
   });
   if (async_ && error.empty()) {
+    // one the disk cache holds is ready in a few milliseconds (about 8 measured): waiting that long spares its draws
+    gpu_.instance.WaitAny(futures_.back(), 20'000'000);
+    const auto done = pipelines_.find(id);
+    if (done != pipelines_.end()) return done->second;
     ++stats_.waiting;
     return nullptr;
   }

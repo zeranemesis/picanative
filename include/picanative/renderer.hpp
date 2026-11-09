@@ -96,6 +96,7 @@ private:
   bool cached_, trusted_;
   bool async_ = false;
   std::set<std::string> compiling_;
+  std::vector<wgpu::Future> futures_;
   pica::CommandProcessor processor_;
   Stats stats_;
 
