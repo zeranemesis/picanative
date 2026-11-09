@@ -464,26 +464,51 @@ Config configure(const pica::State& state, const vertex::Layout& layout, bool in
   return c;
 }
 
-std::string wgsl(const Config& c, const pica::ShaderUnit& vs) {
+namespace {
+
+const char* kDrawStruct = R"(struct Draw {
+  loaders: array<vec4u, 12>,
+  index: vec4u,
+  defaults: array<vec4f, 16>,
+  clip: vec4f,
+  depth: vec4f,
+  tev_constant: array<vec4f, 6>,
+  buffer_color: vec4f,
+  fog_color: vec4f,
+  alpha_reference: vec4u,
+  texture_size: array<vec4u, 3>,
+  texture_border: array<vec4f, 3>,
+  texture_lod: array<vec4f, 3>,
+  lut: vec4u,
+  global_ambient: vec4f,
+  lights: array<array<vec4f, 9>, 8>,
+}
+@group(0) @binding(1) var<uniform> dr: Draw;
+)";
+
+const char* kVOut = R"(struct VOut {
+  @builtin(position) position: vec4f,
+  @location(0) color: vec4f,
+  @location(1) uv01: vec4f,
+  @location(2) uv2: vec2f,
+  @location(3) quaternion: vec4f,
+  @location(4) view: vec3f,
+  @location(5) @interpolate(linear) z: f32,
+  @location(6) uv0w: f32,
+  @location(7) w: f32,
+}
+)";
+
+} // namespace
+
+std::string vertex_wgsl(const Config& c, const pica::ShaderUnit& vs) {
   std::ostringstream w;
   w << shadergen::kVertexUniformsWgsl;
-  w << "struct Draw {\n  loaders: array<vec4u, 12>,\n  index: vec4u,\n  defaults: array<vec4f, 16>,\n  clip: vec4f,\n"
-       "  depth: vec4f,\n  tev_constant: array<vec4f, 6>,\n  buffer_color: vec4f,\n  fog_color: vec4f,\n"
-       "  alpha_reference: vec4u,\n  texture_size: array<vec4u, 3>,\n  texture_border: array<vec4f, 3>,\n"
-       "  texture_lod: array<vec4f, 3>,\n  lut: vec4u,\n  global_ambient: vec4f,\n"
-       "  lights: array<array<vec4f, 9>, 8>,\n}\n";
+  w << kDrawStruct;
   w << "@group(0) @binding(0) var<uniform> vsu: PicaVsUniforms;\n"
-       "@group(0) @binding(1) var<uniform> dr: Draw;\n"
-       "@group(0) @binding(2) var<storage, read> arena: array<u32>;\n"
-       "@group(0) @binding(3) var<storage, read> lut_data: array<vec2f>;\n"
-       "@group(0) @binding(4) var tex0: texture_2d<f32>;\n"
-       "@group(0) @binding(5) var tex1: texture_2d<f32>;\n"
-       "@group(0) @binding(6) var tex2: texture_2d<f32>;\n";
+       "@group(0) @binding(2) var<storage, read> arena: array<u32>;\n";
   w << shadergen::vertex_function(vs, "vsu");
-  w << "struct VOut {\n  @builtin(position) position: vec4f,\n  @location(0) color: vec4f,\n"
-       "  @location(1) uv01: vec4f,\n  @location(2) uv2: vec2f,\n  @location(3) quaternion: vec4f,\n"
-       "  @location(4) view: vec3f,\n  @location(5) @interpolate(linear) z: f32,\n  @location(6) uv0w: f32,\n"
-       "  @location(7) w: f32,\n}\n";
+  w << kVOut;
   w << "fn rb(a: u32) -> u32 { return (arena[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu; }\n"
        "fn r16(a: u32) -> u32 { return rb(a) | (rb(a + 1u) << 8u); }\n"
        "fn r32(a: u32) -> u32 { return r16(a) | (r16(a + 2u) << 16u); }\n";
@@ -540,7 +565,17 @@ std::string wgsl(const Config& c, const pica::ShaderUnit& vs) {
     << ", " << pick(s.slots[7]) << ");\n";
   w << "  vout.view = vec3f(" << pick(s.slots[18]) << ", " << pick(s.slots[19]) << ", " << pick(s.slots[20]) << ");\n";
   w << "  return vout;\n}\n";
+  return w.str();
+}
 
+std::string fragment_wgsl(const Config& c) {
+  std::ostringstream w;
+  w << kDrawStruct;
+  w << "@group(0) @binding(3) var<storage, read> lut_data: array<vec2f>;\n"
+       "@group(0) @binding(4) var tex0: texture_2d<f32>;\n"
+       "@group(0) @binding(5) var tex1: texture_2d<f32>;\n"
+       "@group(0) @binding(6) var tex2: texture_2d<f32>;\n";
+  w << kVOut;
   // fragment stage
   w << "fn wrap(mode: u32, c: i32, size: i32) -> i32 {\n"
        "  switch mode {\n"

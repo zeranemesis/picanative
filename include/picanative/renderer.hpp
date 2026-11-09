@@ -19,7 +19,9 @@
 // - safe (the host does not report the CPU's writes): each command list
 //   loads its surfaces from memory and writes them back when it ends, and
 //   textures are told apart by hashing their memory;
-// - cached (the host calls before_cpu_write): surfaces stay on the GPU from
+// - cached surfaces (the fills, transfers and copies all go through the
+//   renderer, and the host calls sync or before_cpu_write when the CPU
+//   touches what the GPU drew): surfaces stay on the GPU from
 //   one command list to the next and go back to memory only when something
 //   reads them (a transfer, a texture, the CPU through sync); a fill that
 //   covers a whole surface clears it on the GPU; decoded textures stay until
@@ -31,7 +33,7 @@ namespace picanative {
 
 class Renderer {
 public:
-  Renderer(gpu::Context& gpu, Memory& memory, bool host_reports_writes = false);
+  Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces = false, bool trust_cpu_writes = false);
   ~Renderer();
 
   // Runs a command list and its draws.
@@ -85,7 +87,7 @@ private:
 
   gpu::Context& gpu_;
   Memory& memory_;
-  bool cached_;
+  bool cached_, trusted_;
   pica::CommandProcessor processor_;
   Stats stats_;
 
@@ -95,6 +97,7 @@ private:
   wgpu::BindGroupLayout depth_upload_layout_;
   wgpu::TextureView empty_texture_;
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
+  std::unordered_map<std::string, wgpu::ShaderModule> modules_;
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool>, std::unique_ptr<Surface>> surfaces_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
   // cached mode: the texture each (address, format, size, levels) decoded to,

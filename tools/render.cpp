@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
   }
   std::printf("GPU: %s\n", g.adapter_name.c_str());
   auto memory = std::make_unique<HostMemory>();
-  Renderer renderer(g, *memory, cached);
+  Renderer renderer(g, *memory, cached, cached);
   Screen screens[2];
   const auto started = std::chrono::steady_clock::now();
   uint32_t frame = 0, compared = 0;

@@ -44,6 +44,15 @@ PN_API void pn_texture_copy(pn_engine* engine, uint32_t input, uint32_t output, 
 PN_API void pn_sync_for_cpu(pn_engine* engine, uint32_t address, uint32_t size);
 PN_API void pn_cpu_wrote(pn_engine* engine, uint32_t address, uint32_t size);
 
+/* how far the engine may trust the host: PN_CACHE_SURFACES keeps what it
+   draws on the GPU (the host routes every fill, transfer and copy through
+   the engine, and calls pn_sync_for_cpu / pn_cpu_wrote when the CPU touches
+   what the GPU drew); PN_TRUST_CPU_WRITES also keeps decoded textures (the
+   host reports every CPU write). 0, the default, is safe with any host. */
+#define PN_CACHE_SURFACES 1u
+#define PN_TRUST_CPU_WRITES 2u
+PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, uint32_t error_size);
+
 /* counters, for a status line: draws, pipelines, shader errors */
 PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);
 

@@ -173,8 +173,8 @@ struct Renderer::PendingDraw {
   uint32_t upload_offset = 0; // depth upload: where its D24 words start in the arena
 };
 
-Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool host_reports_writes)
-    : gpu_(gpu), memory_(memory), cached_(host_reports_writes), processor_(memory) {
+Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool trust_cpu_writes)
+    : gpu_(gpu), memory_(memory), cached_(cache_surfaces), trusted_(trust_cpu_writes), processor_(memory) {
   processor_.on_draw = [this](const pica::State& state, bool indexed) { record(state, indexed); };
 
   wgpu::BindGroupLayoutEntry entries[7] = {};
@@ -253,6 +253,9 @@ Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool host_reports_writes)
 Renderer::~Renderer() = default;
 
 void Renderer::command_list(uint32_t address, uint32_t size) {
+  // the CPU may have changed textures since the last list unless the host
+  // reports its writes; within a list it cannot
+  if (!trusted_) known_.clear();
   processor_.run(address, size);
   if (cached_) {
     flush(false);
@@ -422,7 +425,7 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   for (uint32_t l = 0; l < levels; ++l) bytes += texture::size(format, std::max(width >> l, 1u), std::max(height >> l, 1u));
   // drawn into in this command list: memory has to get it first
   write_back(address, bytes, false);
-  if (cached_) {
+  {
     const auto found = known_.find({address, format, width | height << 16, levels});
     if (found != known_.end()) return found->second.texture->view;
   }
@@ -438,7 +441,7 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   const uint32_t id[4] = {address, format, width | height << 16, levels};
   key = fnv(reinterpret_cast<const uint8_t*>(id), sizeof id, key);
   auto& slot = textures_[key];
-  if (cached_ && slot) known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
+  if (slot) known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
   if (slot) return slot->view;
   slot = std::make_unique<Texture>();
   ++stats_.textures_decoded;
@@ -465,7 +468,7 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
     gpu_.queue.WriteTexture(&dst, rgba.data(), rgba.size(), &layout, &extent);
   }
   slot->view = slot->texture.CreateView();
-  if (cached_) known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
+  known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
   return slot->view;
 }
 
@@ -476,10 +479,17 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
   if (found != pipelines_.end()) return found->second;
   ++stats_.pipelines;
   Timed timed{stats_.pipelines_time};
-  const std::string source = draw::wgsl(c, vs);
+  const std::string vertex_source = draw::vertex_wgsl(c, vs), fragment_source = draw::fragment_wgsl(c);
+  const std::string source = vertex_source + fragment_source; // for error reports
   wgpu::RenderPipeline result;
   const std::string error = gpu::checked(gpu_, [&] {
-    const wgpu::ShaderModule m = module(gpu_, source);
+    // a module per source, shared by the pipelines that use it
+    auto shared = [&](const std::string& text) {
+      auto& slot = modules_[text];
+      if (!slot) slot = module(gpu_, text);
+      return slot;
+    };
+    const wgpu::ShaderModule m = shared(vertex_source), fm = shared(fragment_source);
     wgpu::RenderPipelineDescriptor pd{};
     pd.layout = pipeline_layout_;
     pd.vertex.module = m;
@@ -510,7 +520,7 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
       target.blend = &blend;
     }
     wgpu::FragmentState fs{};
-    fs.module = m;
+    fs.module = fm;
     fs.entryPoint = "fs";
     fs.targetCount = 1;
     fs.targets = &target;

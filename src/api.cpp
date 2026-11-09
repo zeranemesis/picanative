@@ -36,13 +36,18 @@ struct pn_engine {
 extern "C" {
 
 pn_engine* pn_create(pn_map_fn map, void* user, char* error, uint32_t error_size) {
+  return pn_create_ex(map, user, 0, error, error_size);
+}
+
+pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, uint32_t error_size) {
   auto engine = std::make_unique<pn_engine>(map, user);
   std::string message;
   if (!gpu::create(engine->gpu, message)) {
     if (error && error_size) std::snprintf(error, error_size, "%s", message.c_str());
     return nullptr;
   }
-  engine->renderer = std::make_unique<Renderer>(engine->gpu, engine->memory);
+  engine->renderer = std::make_unique<Renderer>(engine->gpu, engine->memory, (flags & PN_CACHE_SURFACES) != 0,
+                                                (flags & PN_TRUST_CPU_WRITES) != 0);
   return engine.release();
 }
 
@@ -50,8 +55,6 @@ void pn_destroy(pn_engine* engine) { delete engine; }
 
 void pn_command_list(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->command_list(address, size); }
 
-// version 1: every command list writes what it drew back to memory, so the
-// memory operations work on memory directly
 void pn_memory_fill(pn_engine* e, uint32_t start, uint32_t end, uint32_t value, uint32_t width) {
   e->renderer->memory_fill(start, end, value, width);
 }

@@ -2,9 +2,61 @@
 
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <string>
 
 namespace picanative::gpu {
+namespace {
+
+// Dawn's cache of compiled shaders and pipelines, one file per key, kept
+// between runs: a pipeline compiles once per machine. PICANATIVE_CACHE_DIR, or
+// %LOCALAPPDATA%/picanative/cache (./picanative-cache elsewhere).
+std::filesystem::path cache_dir() {
+  if (const char* dir = std::getenv("PICANATIVE_CACHE_DIR")) return dir;
+  if (const char* local = std::getenv("LOCALAPPDATA")) return std::filesystem::path(local) / "picanative" / "cache";
+  return "picanative-cache";
+}
+
+std::filesystem::path cache_file(const void* key, size_t size) {
+  // two FNV-1a hashes of the key, for a name of 128 bits
+  uint64_t a = 0xCBF29CE484222325ull, b = 0x84222325CBF29CE4ull;
+  const auto* bytes = static_cast<const uint8_t*>(key);
+  for (size_t i = 0; i < size; ++i) {
+    a = (a ^ bytes[i]) * 0x100000001B3ull;
+    b = (b ^ bytes[i]) * 0x100000001B3ull + 0x9E3779B97F4A7C15ull;
+  }
+  char name[40];
+  std::snprintf(name, sizeof name, "%016llx%016llx", static_cast<unsigned long long>(a),
+                static_cast<unsigned long long>(b));
+  return cache_dir() / name;
+}
+
+size_t load_cached(const void* key, size_t key_size, void* value, size_t value_size, void*) {
+  std::ifstream in(cache_file(key, key_size), std::ios::binary | std::ios::ate);
+  if (!in) return 0;
+  const size_t size = static_cast<size_t>(in.tellg());
+  if (!value || value_size < size) return size; // Dawn asks the size first
+  in.seekg(0);
+  in.read(static_cast<char*>(value), static_cast<std::streamsize>(size));
+  return in ? size : 0;
+}
+
+void store_cached(const void* key, size_t key_size, const void* value, size_t value_size, void*) {
+  std::error_code error;
+  std::filesystem::create_directories(cache_dir(), error);
+  const std::filesystem::path path = cache_file(key, key_size), part = path.string() + ".part";
+  {
+    std::ofstream out(part, std::ios::binary);
+    out.write(static_cast<const char*>(value), static_cast<std::streamsize>(value_size));
+    if (!out) return;
+  }
+  std::filesystem::rename(part, path, error); // whole files only, even if two runs store at once
+}
+
+} // namespace
 
 bool wait(Context& context, wgpu::Future future) {
   return context.instance.WaitAny(future, UINT64_MAX) == wgpu::WaitStatus::Success;
@@ -46,7 +98,18 @@ bool create(Context& context, std::string& error, wgpu::BackendType backend) {
   std::vector<wgpu::FeatureName> features_wanted;
   if (context.adapter.HasFeature(wgpu::FeatureName::Depth32FloatStencil8))
     features_wanted.push_back(wgpu::FeatureName::Depth32FloatStencil8);
+  // as Aurora sets Dawn up: DXC rather than FXC, no bounds checks added to
+  // every array access (our shaders index many arrays), and the shader cache
+  wgpu::DawnCacheDeviceDescriptor cache{};
+  cache.loadDataFunction = load_cached;
+  cache.storeDataFunction = store_cached;
+  const std::array toggles{"use_dxc", "disable_robustness", "disable_symbol_renaming"};
+  wgpu::DawnTogglesDescriptor toggles_descriptor{};
+  toggles_descriptor.nextInChain = &cache;
+  toggles_descriptor.enabledToggleCount = toggles.size();
+  toggles_descriptor.enabledToggles = toggles.data();
   wgpu::DeviceDescriptor device_descriptor{};
+  device_descriptor.nextInChain = &toggles_descriptor;
   device_descriptor.requiredFeatureCount = features_wanted.size();
   device_descriptor.requiredFeatures = features_wanted.data();
   device_descriptor.SetUncapturedErrorCallback(
