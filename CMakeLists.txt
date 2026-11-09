@@ -11,6 +11,7 @@ add_library(picanative STATIC
   src/pica.cpp
   src/trace.cpp
   src/transfer.cpp
+  src/vertex.cpp
 )
 target_include_directories(picanative PUBLIC include)
 if (MSVC)

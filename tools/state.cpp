@@ -1,13 +1,15 @@
 // Replays a trace through the command processor and the memory operations,
 // and prints a fingerprint of the GPU state at the end of each frame, to
-// compare with the reference's (gfxref with GFXREF_STATE=file).
+// compare with the reference's (gfxref with GFXREF_STATE=file), and, when
+// asked, a fingerprint of each draw's vertex shader inputs (GFXREF_DRAWS).
 //
-// usage: pn_state <trace.pntrace> [output file, stdout otherwise]
+// usage: pn_state <trace.pntrace> [state file, stdout otherwise] [draws file]
 
 #include "picanative/host_memory.hpp"
 #include "picanative/pica.hpp"
 #include "picanative/trace.hpp"
 #include "picanative/transfer.hpp"
+#include "picanative/vertex.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -29,6 +31,17 @@ int main(int argc, char** argv) {
   FILE* out = argc > 2 ? std::fopen(argv[2], "w") : stdout;
   auto memory = std::make_unique<HostMemory>();
   pica::CommandProcessor gpu(*memory);
+  FILE* draws = argc > 3 ? std::fopen(argv[3], "wb") : nullptr;
+  uint64_t draw_number = 0;
+  std::vector<vertex::Inputs> inputs;
+  if (draws) {
+    gpu.on_draw = [&](const pica::State& state, bool indexed) {
+      const auto names = vertex::vertices(state, *memory, indexed);
+      vertex::fetch(vertex::decode(state), *memory, names, inputs);
+      std::fprintf(draws, "%llu %016llx\n", static_cast<unsigned long long>(++draw_number),
+                   static_cast<unsigned long long>(vertex::fingerprint(static_cast<uint32_t>(names.size()), inputs)));
+    };
+  }
   const auto started = std::chrono::steady_clock::now();
   trace::Record r;
   uint32_t frames = 0;
@@ -56,5 +69,6 @@ int main(int argc, char** argv) {
                static_cast<unsigned long long>(gpu.command_lists), static_cast<unsigned long long>(gpu.draws),
                static_cast<unsigned long long>(gpu.immediate_vertices), seconds);
   if (out != stdout) std::fclose(out);
+  if (draws) std::fclose(draws);
   return 0;
 }
