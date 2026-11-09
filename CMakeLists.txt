@@ -29,12 +29,24 @@ add_library(picanative_gpu STATIC src/gpu.cpp src/draw.cpp src/renderer.cpp)
 target_include_directories(picanative_gpu PUBLIC include)
 target_link_libraries(picanative_gpu PUBLIC picanative dawn::webgpu_dawn)
 
+# the engine as a shared library with a C interface (include/picanative/api.h)
+add_library(picanative_api SHARED src/api.cpp)
+target_link_libraries(picanative_api PRIVATE picanative_gpu)
+target_include_directories(picanative_api PUBLIC include)
+set_target_properties(picanative_api PROPERTIES OUTPUT_NAME picanative_engine)
+
 # the tools run next to Dawn's libraries
 function(picanative_copy_dawn target)
   add_custom_command(TARGET ${target} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:${target}> $<TARGET_FILE_DIR:${target}>
     COMMAND_EXPAND_LISTS)
 endfunction()
+
+if (WIN32)
+  add_custom_command(TARGET picanative_api POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:picanative_api> $<TARGET_FILE_DIR:picanative_api>
+    COMMAND_EXPAND_LISTS)
+endif ()
 
 option(PICANATIVE_TOOLS "Build the test tools" ON)
 if (PICANATIVE_TOOLS)

@@ -14,27 +14,47 @@
 
 // Draws what the command lists describe with WebGPU.
 //
-// Version 1, memory is the truth: each command list loads the buffers it
-// draws into from the game's memory, records its draws, runs them in render
-// passes, and writes the buffers back to memory when it ends (or before a
-// draw reads one of them as a texture). The memory operations (fills,
-// transfers, copies) then work on memory as the CPU versions do. The surface
-// cache of the optimisation phase keeps the buffers on the GPU instead.
+// The buffers a command list draws into are surfaces on the GPU. Two modes:
+//
+// - safe (the host does not report the CPU's writes): each command list
+//   loads its surfaces from memory and writes them back when it ends, and
+//   textures are told apart by hashing their memory;
+// - cached (the host calls before_cpu_write): surfaces stay on the GPU from
+//   one command list to the next and go back to memory only when something
+//   reads them (a transfer, a texture, the CPU through sync); a fill that
+//   covers a whole surface clears it on the GPU; decoded textures stay until
+//   their memory is written.
+//
+// The memory operations go through the renderer, which keeps memory and the
+// surfaces in step around them.
 namespace picanative {
 
 class Renderer {
 public:
-  Renderer(gpu::Context& gpu, Memory& memory);
+  Renderer(gpu::Context& gpu, Memory& memory, bool host_reports_writes = false);
   ~Renderer();
 
-  // Runs a command list, its draws included, and writes back what it drew.
+  // Runs a command list and its draws.
   void command_list(uint32_t address, uint32_t size);
+
+  // The memory operations, with physical addresses.
+  void memory_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t width);
+  void display_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
+                        uint32_t flags);
+  void texture_copy(uint32_t input, uint32_t output, uint32_t size, uint32_t input_gap, uint32_t output_gap);
+
+  // Memory gets what the GPU drew in a range, for the CPU to read it.
+  void sync(uint32_t address, uint32_t size);
+  // The CPU is about to write a range (cached mode).
+  void before_cpu_write(uint32_t address, uint32_t size);
 
   pica::CommandProcessor& processor() { return processor_; }
 
   struct Stats {
     uint64_t draws = 0, skipped = 0, passes = 0, pipelines = 0, textures_decoded = 0, flushes = 0;
     uint64_t shader_errors = 0;
+    // where the time goes, in seconds
+    double record = 0, textures = 0, pipelines_time = 0, encode = 0, wait = 0, load = 0, store = 0;
   };
   const Stats& stats() const { return stats_; }
 
@@ -47,7 +67,14 @@ private:
   struct PendingDraw;
 
   void record(const pica::State& state, bool indexed);
-  void flush();
+  // runs the pending work; with write_back, every surface drawn goes back to memory
+  void flush(bool write_back);
+  // runs the pending work, and writes back the surfaces listed
+  void submit(const std::vector<Surface*>& back);
+  // what the GPU drew over a range goes to memory; with forget, the surfaces
+  // over it also stop holding it (memory is about to change there)
+  void write_back(uint32_t address, uint32_t size, bool forget);
+  void forget_textures(uint32_t address, uint32_t size);
   Surface& surface(uint32_t address, uint32_t width, uint32_t height, bool depth);
   void load(Surface& surface);
   void store(Surface& surface, const std::vector<uint8_t>& data);
@@ -58,6 +85,7 @@ private:
 
   gpu::Context& gpu_;
   Memory& memory_;
+  bool cached_;
   pica::CommandProcessor processor_;
   Stats stats_;
 
@@ -69,6 +97,13 @@ private:
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool>, std::unique_ptr<Surface>> surfaces_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
+  // cached mode: the texture each (address, format, size, levels) decoded to,
+  // while its memory is unchanged
+  struct Known {
+    uint32_t address, bytes;
+    Texture* texture;
+  };
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, Known> known_;
 
   // what the pending draws need, uploaded when they run
   std::vector<PendingDraw> pending_;

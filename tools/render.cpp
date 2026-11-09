@@ -2,7 +2,8 @@
 // memory operations by the exact CPU versions, and each screen the trace
 // recorded compared with what the engine left in memory.
 //
-// usage: pn_render <trace.pntrace> [directory for pictures: ours | recorded | difference]
+// usage: pn_render [--cached] <trace.pntrace> [directory for pictures: ours | recorded | difference]
+//   --cached: surfaces stay on the GPU, the trace reporting the CPU's writes
 
 #include "picanative/color.hpp"
 #include "picanative/gpu.hpp"
@@ -59,8 +60,10 @@ void write_ppm(const std::filesystem::path& path, uint32_t width, uint32_t heigh
 } // namespace
 
 int main(int argc, char** argv) {
+  const bool cached = argc > 1 && std::string(argv[1]) == "--cached";
+  if (cached) --argc, ++argv;
   if (argc < 2) {
-    std::fprintf(stderr, "usage: pn_render <trace.pntrace> [directory for pictures]\n");
+    std::fprintf(stderr, "usage: pn_render [--cached] <trace.pntrace> [directory for pictures]\n");
     return 2;
   }
   const std::filesystem::path pictures = argc > 2 ? argv[2] : "";
@@ -78,7 +81,7 @@ int main(int argc, char** argv) {
   }
   std::printf("GPU: %s\n", g.adapter_name.c_str());
   auto memory = std::make_unique<HostMemory>();
-  Renderer renderer(g, *memory);
+  Renderer renderer(g, *memory, cached);
   Screen screens[2];
   const auto started = std::chrono::steady_clock::now();
   uint32_t frame = 0, compared = 0;
@@ -87,6 +90,7 @@ int main(int argc, char** argv) {
   while (reader.next(r)) {
     switch (r.kind) {
     case trace::Memory:
+      renderer.before_cpu_write(r.word(0), static_cast<uint32_t>(r.payload.size() - 4));
       if (uint8_t* bytes = memory->map(r.word(0), static_cast<uint32_t>(r.payload.size() - 4)))
         std::memcpy(bytes, r.payload.data() + 4, r.payload.size() - 4);
       break;
@@ -99,15 +103,17 @@ int main(int argc, char** argv) {
       break;
     }
     case trace::CommandList: renderer.command_list(r.word(0), r.word(1)); break;
-    case trace::MemoryFill: memory_fill(*memory, r.word(0), r.word(1), r.word(2), r.word(3)); break;
+    case trace::MemoryFill: renderer.memory_fill(r.word(0), r.word(1), r.word(2), r.word(3)); break;
     case trace::DisplayTransfer:
-      display_transfer(*memory, r.word(0), r.word(1), r.word(2), r.word(3), r.word(4));
+      renderer.display_transfer(r.word(0), r.word(1), r.word(2), r.word(3), r.word(4));
       break;
-    case trace::TextureCopy: texture_copy(*memory, r.word(0), r.word(1), r.word(2), r.word(3), r.word(4)); break;
+    case trace::TextureCopy: renderer.texture_copy(r.word(0), r.word(1), r.word(2), r.word(3), r.word(4)); break;
     case trace::Frame: frame = r.word(0); break;
     case trace::Screen: {
       const uint32_t index = r.word(0), width = r.word(1), height = r.word(2);
-      const std::vector<uint8_t> ours = scan(*memory, screens[index & 1], width, height);
+      const Screen& shown = screens[index & 1];
+      renderer.sync(shown.left[shown.active ? 1 : 0], (shown.stride ? shown.stride : height * 4) * width);
+      const std::vector<uint8_t> ours = scan(*memory, shown, width, height);
       const uint8_t* recorded = r.payload.data() + 12;
       double squared = 0;
       uint32_t off = 0;
@@ -151,6 +157,8 @@ int main(int argc, char** argv) {
   std::printf("%u frames in %.1f s: %llu draws (%llu skipped), %llu pipelines, %llu shader errors, %llu textures, %llu passes\n",
               frame, seconds, (unsigned long long)s.draws, (unsigned long long)s.skipped, (unsigned long long)s.pipelines,
               (unsigned long long)s.shader_errors, (unsigned long long)s.textures_decoded, (unsigned long long)s.passes);
+  std::printf("time: record %.1f s (textures %.1f, pipelines %.1f), encode %.1f, GPU wait + store %.1f (store %.1f), load %.1f\n",
+              s.record, s.textures, s.pipelines_time, s.encode, s.wait, s.store, s.load);
   if (compared) std::printf("average PSNR over %u screens: %.1f dB\n", compared, total_psnr / compared);
   for (const std::string& e : renderer.errors) std::printf("--- shader error ---\n%.6000s\n", e.c_str());
   return 0;
