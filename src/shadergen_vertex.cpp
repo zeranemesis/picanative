@@ -104,8 +104,46 @@ std::string compare(uint32_t mode, const std::string& a, const std::string& b) {
   return "(" + a + " " + ops[mode] + " " + b + ")";
 }
 
+// The temporaries that may hold an infinity or a NaN (bit k: r[k]): what
+// rcp, rsq, ex2 and lg2 give, and what is computed from it, wherever it is
+// in the program. Only multiplications reading one need the hardware's
+// 0 * inf = 0 (pmul), which costs DXC about a second per shader.
+// shortcut: inputs and uniforms are taken as finite, and finite products
+// overflowing to infinity are ignored; track those too if a game feeds them.
+bool risky(uint32_t reg, uint32_t unsafe) { return reg >= 0x10 && reg < 0x20 && (unsafe >> (reg - 0x10) & 1); }
+
+uint32_t unsafe_temporaries(const pica::ShaderUnit& unit) {
+  uint32_t unsafe = 0;
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (uint32_t word : unit.program) {
+      const uint32_t op = opcode(word);
+      if (flow(op) || op == Mova || op == kCmp || op == Sge || op == Slt || op == SgeI || op == SltI) continue;
+      uint32_t dest, sources[3];
+      if (op == kMad || op == kMadI) {
+        dest = word >> 24 & 0x1F;
+        sources[0] = word >> 17 & 0x1F;
+        sources[1] = op == kMadI ? word >> 12 & 0x1F : word >> 10 & 0x7F;
+        sources[2] = op == kMadI ? word >> 5 & 0x7F : word >> 5 & 0x1F;
+      } else {
+        dest = word >> 21 & 0x1F;
+        sources[0] = inverted(op) ? word >> 14 & 0x1F : word >> 12 & 0x7F;
+        sources[1] = inverted(op) ? word >> 7 & 0x7F : word >> 7 & 0x1F;
+        sources[2] = 0;
+      }
+      const bool bad = op == Rcp || op == Rsq || op == Ex2 || op == Lg2 || risky(sources[0], unsafe) ||
+                       risky(sources[1], unsafe) || risky(sources[2], unsafe);
+      if (bad && dest >= 0x10 && !risky(dest, unsafe)) {
+        unsafe |= 1u << (dest - 0x10);
+        changed = true;
+      }
+    }
+  }
+  return unsafe;
+}
+
 // one arithmetic instruction
-std::string arithmetic(uint32_t word, const std::array<uint32_t, pica::kDescriptorSize>& descriptors) {
+std::string arithmetic(uint32_t word, const std::array<uint32_t, pica::kDescriptorSize>& descriptors, uint32_t unsafe) {
   const uint32_t op = opcode(word);
   if (op == kMad || op == kMadI) {
     const uint32_t d = descriptors[(word & 0x1F) % pica::kDescriptorSize];
@@ -120,7 +158,8 @@ std::string arithmetic(uint32_t word, const std::array<uint32_t, pica::kDescript
       src3 = word >> 5 & 0x1F;
       index2 = index;
     }
-    return "{ let t = pmul(" + operand(src1, 0, d, 0) + ", " + operand(src2, index2, d, 1) + ") + " +
+    const char* mul = risky(src1, unsafe) || risky(src2, unsafe) ? "pmul(" : "fmul(";
+    return std::string("{ let t = ") + mul + operand(src1, 0, d, 0) + ", " + operand(src2, index2, d, 1) + ") + " +
            operand(src3, index3, d, 2) + "; " + write_masked(word >> 24 & 0x1F, d) + "}";
   }
   const uint32_t d = descriptors[(word & 0x7F) % pica::kDescriptorSize];
@@ -136,17 +175,18 @@ std::string arithmetic(uint32_t word, const std::array<uint32_t, pica::kDescript
     index1 = index;
   }
   const std::string a = operand(src1, index1, d, 0), b = operand(src2, index2, d, 1);
+  const std::string p = risky(src1, unsafe) || risky(src2, unsafe) ? "p" : "f"; // pmul or fmul, pdot3 or fdot3...
   std::string value;
   switch (op) {
   case Add: value = a + " + " + b; break;
-  case Mul: value = "pmul(" + a + ", " + b + ")"; break;
+  case Mul: value = p + "mul(" + a + ", " + b + ")"; break;
   // NaN as the hardware has it: max(0, NaN) is NaN, max(NaN, 0) is 0
   case Max: value = "pmax(" + a + ", " + b + ")"; break;
   case Min: value = "pmin(" + a + ", " + b + ")"; break;
-  case Dp3: value = "vec4f(pdot3(" + a + ", " + b + "))"; break;
-  case Dp4: value = "vec4f(pdot4(" + a + ", " + b + "))"; break;
+  case Dp3: value = "vec4f(" + p + "dot3(" + a + ", " + b + "))"; break;
+  case Dp4: value = "vec4f(" + p + "dot4(" + a + ", " + b + "))"; break;
   case Dph:
-  case DphI: value = "vec4f(pdot3(" + a + ", " + b + ") + (" + b + ").w)"; break;
+  case DphI: value = "vec4f(" + p + "dot3(" + a + ", " + b + ") + (" + b + ").w)"; break;
   case Mov: value = a; break;
   case Flr: value = "floor(" + a + ")"; break;
   case Rcp: value = "vec4f(1.0 / (" + a + ").x)"; break;
@@ -158,7 +198,7 @@ std::string arithmetic(uint32_t word, const std::array<uint32_t, pica::kDescript
   case Slt:
   case SltI: value = "select(vec4f(0.0), vec4f(1.0), " + a + " < " + b + ")"; break;
   case Dst:
-  case DstI: value = "vec4f(1.0, pmul1((" + a + ").y, (" + b + ").y), (" + a + ").z, (" + b + ").w)"; break;
+  case DstI: value = "vec4f(1.0, " + p + "mul1((" + a + ").y, (" + b + ").y), (" + a + ").z, (" + b + ").w)"; break;
   case LitP:
     return "{ let s = " + a + "; cc = vec2<bool>(s.x >= 0.0, s.w >= 0.0); let t = vec4f(pmax1(s.x, 0.0), " +
            "clamp(s.y, -127.9961, 127.9961), 0.0, pmax1(s.w, 0.0)); " + write_masked(word >> 21 & 0x1F, d) + "}";
@@ -188,6 +228,7 @@ std::string arithmetic(uint32_t word, const std::array<uint32_t, pica::kDescript
 // too deep or too long.
 struct Structured {
   const pica::ShaderUnit& unit;
+  uint32_t unsafe;
   std::ostringstream out;
   int emitted = 0, jumps = 0;
 
@@ -210,7 +251,7 @@ struct Structured {
       if (++emitted > 8192) return false;
       const uint32_t word = unit.program[pc], op = opcode(word);
       if (!flow(op)) {
-        const std::string code = arithmetic(word, unit.descriptors);
+        const std::string code = arithmetic(word, unit.descriptors, unsafe);
         if (!code.empty()) out << code << "\n";
         ++pc;
         continue;
@@ -287,6 +328,10 @@ const char* kHelpers =
     "fn pmul1(a: f32, b: f32) -> f32 { let p = a * b; return select(p, 0.0, (p != p) & (a == a) & (b == b)); }\n"
     "fn pdot3(a: vec4f, b: vec4f) -> f32 { let p = pmul(a, b); return (p.x + p.y) + p.z; }\n"
     "fn pdot4(a: vec4f, b: vec4f) -> f32 { let p = pmul(a, b); return ((p.x + p.y) + p.z) + p.w; }\n"
+    "fn fmul(a: vec4f, b: vec4f) -> vec4f { return a * b; }\n"
+    "fn fmul1(a: f32, b: f32) -> f32 { return a * b; }\n"
+    "fn fdot3(a: vec4f, b: vec4f) -> f32 { let p = a * b; return (p.x + p.y) + p.z; }\n"
+    "fn fdot4(a: vec4f, b: vec4f) -> f32 { let p = a * b; return ((p.x + p.y) + p.z) + p.w; }\n"
     "fn pmax(a: vec4f, b: vec4f) -> vec4f { return select(b, a, a > b); }\n"
     "fn pmin(a: vec4f, b: vec4f) -> vec4f { return select(b, a, a < b); }\n"
     "fn pmax1(a: f32, b: f32) -> f32 { return select(b, a, a > b); }\n";
@@ -324,7 +369,7 @@ std::string vertex_function(const pica::ShaderUnit& unit, const std::string& uni
   w << "  for (var k = 0; k < 16; k++) { r[k] = vec4f(0.0, 0.0, 0.0, 1.0); }\n";
   w << "  var a = vec3<i32>(0);\n  var cc = vec2<bool>(false, false);\n";
   if (!std::getenv("PN_VS_STATE_MACHINE")) { // the state machine alone, to check one against the other
-    Structured s{unit};
+    Structured s{unit, unsafe_temporaries(unit)};
     if (s.emit(unit.entry_point, pica::kProgramSize, 0, 0)) {
       w << s.out.str() << "  return o;\n}\n";
       return name_uniforms(w.str(), uniforms);
@@ -336,6 +381,7 @@ std::string vertex_function(const pica::ShaderUnit& unit, const std::string& uni
 namespace {
 std::string state_machine(const pica::ShaderUnit& unit, const std::string& uniforms, std::ostringstream& w) {
   const auto& program = unit.program;
+  const uint32_t unsafe = unsafe_temporaries(unit);
   constexpr uint32_t size = pica::kProgramSize;
 
   // the addresses control can arrive at other than by falling through
@@ -407,7 +453,7 @@ std::string state_machine(const pica::ShaderUnit& unit, const std::string& unifo
       if (pc != start && starts.count(pc)) break; // the next block starts here
       const uint32_t word = program[pc], op = opcode(word);
       if (!flow(op)) {
-        const std::string code = arithmetic(word, unit.descriptors);
+        const std::string code = arithmetic(word, unit.descriptors, unsafe);
         if (!code.empty()) w << "        " << code << "\n";
         continue;
       }

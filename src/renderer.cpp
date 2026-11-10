@@ -167,6 +167,7 @@ struct Renderer::PendingDraw {
   double clear_color[4] = {};
   uint32_t vs_offset, draw_offset, vertex_count;
   wgpu::TextureView views[3];
+  wgpu::Sampler samplers[3];
   uint32_t scissor[4];
   uint32_t stencil_reference;
   float blend_constant[4];
@@ -177,7 +178,7 @@ Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool 
     : gpu_(gpu), memory_(memory), cached_(cache_surfaces), trusted_(trust_cpu_writes), processor_(memory) {
   processor_.on_draw = [this](const pica::State& state, bool indexed) { record(state, indexed); };
 
-  wgpu::BindGroupLayoutEntry entries[7] = {};
+  wgpu::BindGroupLayoutEntry entries[10] = {};
   for (int i = 0; i < 2; ++i) {
     entries[i].binding = i;
     entries[i].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
@@ -192,11 +193,16 @@ Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool 
   for (int i = 4; i < 7; ++i) {
     entries[i].binding = i;
     entries[i].visibility = wgpu::ShaderStage::Fragment;
-    entries[i].texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+    entries[i].texture.sampleType = wgpu::TextureSampleType::Float;
     entries[i].texture.viewDimension = wgpu::TextureViewDimension::e2D;
   }
+  for (int i = 7; i < 10; ++i) {
+    entries[i].binding = i;
+    entries[i].visibility = wgpu::ShaderStage::Fragment;
+    entries[i].sampler.type = wgpu::SamplerBindingType::Filtering;
+  }
   wgpu::BindGroupLayoutDescriptor ld{};
-  ld.entryCount = 7;
+  ld.entryCount = 10;
   ld.entries = entries;
   layout_ = gpu_.device.CreateBindGroupLayout(&ld);
   wgpu::PipelineLayoutDescriptor pld{};
@@ -401,6 +407,30 @@ uint32_t Renderer::lookup_tables(const pica::State& state) {
   }
   last_luts_at_ = at;
   return at;
+}
+
+// The sampler a texture unit's configuration register describes: its wraps
+// (the border is the shader's), its filters.
+wgpu::Sampler Renderer::sampler(uint32_t config) {
+  const uint32_t key = config & 0x01007706;
+  auto& slot = samplers_[key];
+  if (slot) return slot;
+  auto wrap = [](uint32_t mode) {
+    switch (mode & 7) {
+    case 2: case 6: case 7: return wgpu::AddressMode::Repeat;
+    case 3: return wgpu::AddressMode::MirrorRepeat;
+    default: return wgpu::AddressMode::ClampToEdge; // edge, and border outside the shader's test
+    }
+  };
+  auto filter = [](uint32_t bit) { return bit ? wgpu::FilterMode::Linear : wgpu::FilterMode::Nearest; };
+  wgpu::SamplerDescriptor sd{};
+  sd.addressModeU = wrap(key >> 12);
+  sd.addressModeV = wrap(key >> 8);
+  sd.magFilter = filter(key >> 1 & 1);
+  sd.minFilter = filter(key >> 2 & 1);
+  sd.mipmapFilter = key >> 24 & 1 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
+  slot = gpu_.device.CreateSampler(&sd);
+  return slot;
 }
 
 wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t size[4], float border[4],
@@ -638,6 +668,7 @@ void Renderer::record(const pica::State& state, bool indexed) {
     d.views[unit] = config.textures >> unit & 1
                         ? texture(state, unit, du.texture_size[unit], du.texture_border[unit], du.texture_lod[unit])
                         : empty_texture_;
+  for (int unit = 0; unit < 3; ++unit) d.samplers[unit] = sampler(du.texture_size[unit][3]);
   // vertices: the arrays from the lowest vertex named to the highest
   const std::vector<uint32_t> names = vertex::vertices(state, memory_, indexed);
   uint32_t low = UINT32_MAX, high = 0;
@@ -826,15 +857,16 @@ void Renderer::submit(const std::vector<Surface*>& back) {
       continue;
     }
     if (!pass || pass_depth_only || pass_color != d.color || pass_depth != d.depth) begin_pass(d.color, d.depth);
-    wgpu::BindGroupEntry e[7] = {};
+    wgpu::BindGroupEntry e[10] = {};
     e[0].binding = 0, e[0].buffer = uniforms, e[0].size = kVsUniformsSize;
     e[1].binding = 1, e[1].buffer = uniforms, e[1].size = sizeof(draw::DrawUniforms);
     e[2].binding = 2, e[2].buffer = arena, e[2].size = align_up(static_cast<uint32_t>(std::max<size_t>(arena_.size(), 16)), 16);
     e[3].binding = 3, e[3].buffer = luts, e[3].size = align_up(static_cast<uint32_t>(std::max<size_t>(luts_.size() * 4, 16)), 16);
     for (int u = 0; u < 3; ++u) e[4 + u].binding = 4 + u, e[4 + u].textureView = d.views[u];
+    for (int u = 0; u < 3; ++u) e[7 + u].binding = 7 + u, e[7 + u].sampler = d.samplers[u];
     wgpu::BindGroupDescriptor bd{};
     bd.layout = layout_;
-    bd.entryCount = 7;
+    bd.entryCount = 10;
     bd.entries = e;
     const uint32_t offsets[2] = {d.vs_offset, d.draw_offset};
     pass.SetPipeline(d.pipeline);

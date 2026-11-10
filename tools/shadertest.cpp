@@ -89,9 +89,26 @@ double error(float ours, float reference) {
   return std::fabs(double{ours} - reference) / std::max(1.0, std::fabs(double{reference}));
 }
 
+// Only multiplications reading what rcp, rsq, ex2 or lg2 gave keep the
+// hardware's 0 * inf = 0: rcp r0, v0; mul r1, c0, r0; mul r2, c0, v0; end.
+bool check_exact_multiplications() {
+  pica::ShaderUnit unit;
+  unit.descriptors[0] = 0xF | 0x1Bu << 5 | 0x1Bu << 14 | 0x1Bu << 23; // xyzw everywhere, all written
+  unit.program[0] = 0x0Eu << 26 | 0x10u << 21;
+  unit.program[1] = 0x08u << 26 | 0x11u << 21 | 0x20u << 12 | 0x10u << 7;
+  unit.program[2] = 0x08u << 26 | 0x12u << 21 | 0x20u << 12;
+  unit.program[3] = 0x22u << 26;
+  const std::string wgsl = shadergen::vertex_function(unit, "u");
+  const bool ok = wgsl.find("pmul(cu(0).xyzw, r[0].xyzw)") != std::string::npos &&
+                  wgsl.find("fmul(cu(0).xyzw, v[0].xyzw)") != std::string::npos;
+  if (!ok) std::printf("FAIL exact multiplications:\n%s\n", wgsl.c_str());
+  return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+  if (!check_exact_multiplications()) return 1;
   if (argc < 2) {
     std::fprintf(stderr, "usage: pn_shadertest <directory of .pnvs> [--show name]\n");
     return 2;

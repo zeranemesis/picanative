@@ -87,6 +87,7 @@ private:
   void load(Surface& surface);
   void store(Surface& surface, const std::vector<uint8_t>& data);
   wgpu::TextureView texture(const pica::State& state, int unit, uint32_t uniforms[4], float border[4], float lod[4]);
+  wgpu::Sampler sampler(uint32_t config);
   wgpu::RenderPipeline pipeline(const draw::Config& config, const pica::ShaderUnit& vs);
   uint32_t arena_copy(uint32_t address, uint32_t size);
   uint32_t lookup_tables(const pica::State& state);
@@ -105,6 +106,7 @@ private:
   wgpu::RenderPipeline depth_upload_;
   wgpu::BindGroupLayout depth_upload_layout_;
   wgpu::TextureView empty_texture_;
+  std::unordered_map<uint32_t, wgpu::Sampler> samplers_;
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
   std::unordered_map<std::string, wgpu::ShaderModule> modules_;
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool>, std::unique_ptr<Surface>> surfaces_;

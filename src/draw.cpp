@@ -338,38 +338,25 @@ std::string lighting_function(const Config& c) {
   return w.str();
 }
 
+// A texture unit's lookup: the sampler bound with it wraps and filters (see
+// Renderer::sampler); the border color and the level of detail are the
+// shader's. Rows are stored top down, so t runs the other way.
 std::string texture_functions(int unit) {
   const std::string n = std::to_string(unit);
   std::ostringstream w;
-  w << "fn texel" << n << "(level: u32, x: i32, y: i32) -> vec4f {\n"
-    << "  let size = dr.texture_size[" << n << "];\n"
-    << "  let w = i32(max(size.x >> level, 1u));\n  let h = i32(max(size.y >> level, 1u));\n"
-    << "  let ws = (size.w >> 12u) & 7u;\n  let wt = (size.w >> 8u) & 7u;\n"
-    << "  if ((border(ws) && (x < 0 || x >= w)) || (border(wt) && (y < 0 || y >= h))) { return dr.texture_border["
-    << n << "]; }\n"
-    << "  return textureLoad(tex" << n << ", vec2i(wrap(ws, x, w), wrap(wt, y, h)), i32(level));\n}\n";
-  w << "fn sample_level" << n << "(level: u32, uv: vec2f, filtered: bool) -> vec4f {\n"
-    << "  let size = dr.texture_size[" << n << "];\n"
-    << "  let fx = uv.x * f32(max(size.x >> level, 1u));\n  let fy = (1.0 - uv.y) * f32(max(size.y >> level, 1u));\n"
-    << "  if (!filtered) { return texel" << n << "(level, i32(floor(fx)), i32(floor(fy))); }\n"
-    << "  let gx = fx - 0.5;\n  let gy = fy - 0.5;\n  let x0 = floor(gx);\n  let y0 = floor(gy);\n"
-    << "  let tx = gx - x0;\n  let ty = gy - y0;\n  let ix = i32(x0);\n  let iy = i32(y0);\n"
-    << "  let a = texel" << n << "(level, ix, iy);\n  let b = texel" << n << "(level, ix + 1, iy);\n"
-    << "  let c = texel" << n << "(level, ix, iy + 1);\n  let d = texel" << n << "(level, ix + 1, iy + 1);\n"
-    << "  let top = a + (b - a) * tx;\n  let bottom = c + (d - c) * tx;\n  return top + (bottom - top) * ty;\n}\n";
   w << "fn sample" << n << "(uv: vec2f, rate: f32) -> vec4f {\n"
-    << "  let size = dr.texture_size[" << n << "];\n  let magnify = (size.w & 2u) != 0u;\n"
-    << "  if (size.z <= 1u) { return sample_level" << n << "(0u, uv, magnify); }\n"
-    << "  let lod = dr.texture_lod[" << n << "];\n"
-    << "  let level = clamp(rate + lod.x, lod.y, lod.z);\n"
-    << "  if (!(level > 0.0)) { return sample_level" << n << "(0u, uv, magnify); }\n"
-    << "  let config = u32(lod.w);\n  let mip_linear = (config & 1u) != 0u;\n"
-    << "  if ((config & 2u) == 0u) { return sample_level" << n
-    << "(u32(ceil(level + 0.5) - 1.0), uv, mip_linear); }\n"
-    << "  let larger = u32(floor(level));\n  let smaller = min(larger + 1u, u32(lod.z));\n"
-    << "  let a = sample_level" << n << "(larger, uv, mip_linear);\n  let b = sample_level" << n
-    << "(smaller, uv, mip_linear);\n"
-    << "  return a + (b - a) * (level - floor(level));\n}\n";
+    << "  let size = dr.texture_size[" << n << "];\n"
+    << "  let st = vec2f(uv.x, 1.0 - uv.y);\n"
+    << "  let ws = (size.w >> 12u) & 7u;\n  let wt = (size.w >> 8u) & 7u;\n"
+    << "  if ((border(ws) && (st.x < 0.0 || st.x >= 1.0)) || (border(wt) && (st.y < 0.0 || st.y >= 1.0))) { return "
+       "dr.texture_border["
+    << n << "]; }\n"
+    << "  var level = 0.0;\n"
+    << "  if (size.z > 1u) {\n"
+    << "    let lod = dr.texture_lod[" << n << "];\n"
+    << "    let l = clamp(rate + lod.x, lod.y, lod.z);\n"
+    << "    level = select(0.0, l, l > 0.0);\n  }\n"
+    << "  return textureSampleLevel(tex" << n << ", smp" << n << ", st, level);\n}\n";
   return w.str();
 }
 
@@ -574,15 +561,13 @@ std::string fragment_wgsl(const Config& c) {
   w << "@group(0) @binding(3) var<storage, read> lut_data: array<vec2f>;\n"
        "@group(0) @binding(4) var tex0: texture_2d<f32>;\n"
        "@group(0) @binding(5) var tex1: texture_2d<f32>;\n"
-       "@group(0) @binding(6) var tex2: texture_2d<f32>;\n";
+       "@group(0) @binding(6) var tex2: texture_2d<f32>;\n"
+       "@group(0) @binding(7) var smp0: sampler;\n"
+       "@group(0) @binding(8) var smp1: sampler;\n"
+       "@group(0) @binding(9) var smp2: sampler;\n";
   w << kVOut;
   // fragment stage
-  w << "fn wrap(mode: u32, c: i32, size: i32) -> i32 {\n"
-       "  switch mode {\n"
-       "    case 0u, 1u, 4u, 5u: { return clamp(c, 0, size - 1); }\n"
-       "    case 3u: { let p = ((c % (size * 2)) + size * 2) % (size * 2); return select(size * 2 - 1 - p, p, p < size); }\n"
-       "    default: { return ((c % size) + size) % size; }\n  }\n}\n"
-       "fn border(mode: u32) -> bool { return mode == 1u || mode == 5u; }\n"
+  w << "fn border(mode: u32) -> bool { return mode == 1u || mode == 5u; }\n"
        "fn compare(function: u32, a: f32, b: f32) -> bool {\n"
        "  switch function {\n    case 0u: { return false; }\n    case 1u: { return true; }\n"
        "    case 2u: { return a == b; }\n    case 3u: { return a != b; }\n    case 4u: { return a < b; }\n"
