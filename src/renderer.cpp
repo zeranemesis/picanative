@@ -186,6 +186,9 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
 struct Renderer::Surface {
   uint32_t address, width, height;
   bool depth;
+  // a color surface's format in memory (the GPU holds it as RGBA8); depth is D24S8
+  ColorFormat format = ColorFormat::RGBA8;
+  uint32_t bytes() const { return width * height * (depth ? 4 : bytes_per_pixel(format)); }
   wgpu::Texture texture;
   bool loaded = false; // holds what memory had, in this command list
   bool drawn = false;  // drawn into since, to write back
@@ -215,6 +218,9 @@ struct Renderer::PendingDraw {
 Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool trust_cpu_writes)
     : gpu_(gpu), memory_(memory), cached_(cache_surfaces), trusted_(trust_cpu_writes), processor_(memory) {
   processor_.on_draw = [this](const pica::State& state, bool indexed) { record(state, indexed); };
+  processor_.on_immediate = [this](const pica::State& state, const std::vector<pica::CommandProcessor::Vertex>& v) {
+    record(state, false, &v);
+  };
 
   wgpu::BindGroupLayoutEntry entries[4] = {};
   for (int i = 0; i < 2; ++i) {
@@ -326,11 +332,12 @@ void Renderer::command_list(uint32_t address, uint32_t size) {
   for (auto& [key, s] : surfaces_) s->loaded = false;
 }
 
-Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t height, bool depth) {
-  auto& slot = surfaces_[{address, width, height, depth}];
+Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t height, bool depth, uint32_t format) {
+  auto& slot = surfaces_[{address, width, height, depth, format}];
   if (!slot) {
     slot = std::make_unique<Surface>();
     slot->address = address, slot->width = width, slot->height = height, slot->depth = depth;
+    slot->format = static_cast<ColorFormat>(format);
     wgpu::TextureDescriptor td{};
     td.size = {width, height, 1};
     td.format = depth ? wgpu::TextureFormat::Depth32FloatStencil8 : wgpu::TextureFormat::RGBA8Unorm;
@@ -344,17 +351,17 @@ Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t 
 // what memory holds in a surface, before this command list draws into it
 void Renderer::load(Surface& s) {
   if (s.loaded) return;
-  deliver(s.address, s.width * s.height * 4);
+  deliver(s.address, s.bytes());
   Timed timed{stats_.load};
   s.loaded = true;
-  const uint32_t bpp = 4;
+  const uint32_t bpp = s.depth ? 4 : bytes_per_pixel(s.format);
   const uint8_t* bytes = memory_.map(s.address, s.width * s.height * bpp);
   if (!s.depth) {
     std::vector<uint8_t> rgba(size_t{s.width} * s.height * 4, 0);
     if (bytes)
       for (uint32_t y = 0; y < s.height; ++y)
         for (uint32_t x = 0; x < s.width; ++x) {
-          const Rgba c = decode(ColorFormat::RGBA8, bytes + tiled_offset(x, y, s.width, bpp));
+          const Rgba c = decode(s.format, bytes + tiled_offset(x, y, s.width, bpp));
           std::memcpy(&rgba[(size_t{y} * s.width + x) * 4], c.data(), 4);
         }
     wgpu::TexelCopyTextureInfo dst{};
@@ -399,14 +406,14 @@ void Renderer::load(Surface& s) {
 // back to memory, tiled, as the PICA leaves its buffers
 void Renderer::store(Surface& s, const std::vector<uint8_t>& data) {
   Timed timed{stats_.store};
-  uint8_t* bytes = memory_.map(s.address, s.width * s.height * 4);
+  uint8_t* bytes = memory_.map(s.address, s.bytes());
   if (!bytes) return;
   const uint32_t row = align_up(s.width * 4, 256);
   if (!s.depth) {
     for (uint32_t y = 0; y < s.height; ++y)
       for (uint32_t x = 0; x < s.width; ++x) {
         const uint8_t* c = &data[size_t{y} * row + x * 4];
-        encode(ColorFormat::RGBA8, {c[0], c[1], c[2], c[3]}, bytes + tiled_offset(x, y, s.width, 4));
+        encode(s.format, {c[0], c[1], c[2], c[3]}, bytes + tiled_offset(x, y, s.width, bytes_per_pixel(s.format)));
       }
     return;
   }
@@ -699,21 +706,34 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
 }
 
 
-void Renderer::record(const pica::State& state, bool indexed) {
+void Renderer::record(const pica::State& state, bool indexed, const std::vector<pica::CommandProcessor::Vertex>* immediate) {
   ++stats_.draws;
   Timed timed{stats_.record};
   const auto& r = state.regs;
   // the color and depth buffers the draw renders into
   const uint32_t dims = r[0x11E], width = dims & 0x7FF, height = (dims >> 12 & 0x3FF) + 1;
   const uint32_t color_address = (r[0x11D] & 0x0FFFFFFF) << 3, depth_address = (r[0x11C] & 0x0FFFFFFF) << 3;
-  if (width == 0 || color_address == 0 || ((r[0x117] >> 16) & 7) != 0 || (r[0x116] & 3) != 3) {
-    // shortcut: only RGBA8 color and D24S8 depth so far, the formats SM3DL uses
+  if (width == 0 || color_address == 0 || (r[0x116] & 3) != 3) {
+    // shortcut: D24S8 depth only so far, what SM3DL uses (the color formats are all there)
     ++stats_.skipped;
     return;
   }
-  const vertex::Layout layout = vertex::decode(state);
+  // immediate vertices: one array of their attributes as floats, each attribute
+  // to the input the shader's permutation names, the others zero (as the reference)
+  const uint32_t attributes = (r[0x242] & 0xF) + 1;
+  vertex::Layout layout;
+  if (immediate) {
+    vertex::Loader loader{0, 0, attributes * 16, attributes * 16, {}};
+    const uint64_t map = r[pica::kRegVsBlock + 0x0B] | uint64_t{r[pica::kRegVsBlock + 0x0C]} << 32;
+    for (uint32_t id = 0; id < attributes; ++id)
+      loader.fields.push_back({id * 16, vertex::Float, 4, static_cast<uint32_t>(map >> (id * 4) & 0xF)});
+    layout.loaders.push_back(std::move(loader));
+    for (auto& input : layout.defaults) input = {0, 0, 0, 0};
+  } else {
+    layout = vertex::decode(state);
+  }
   const draw::Config config = draw::configure(state, layout, indexed);
-  const uint32_t count = r[0x228];
+  const uint32_t count = immediate ? static_cast<uint32_t>(immediate->size()) : r[0x228];
   uint32_t corners = 0;
   if (config.topology == 1 || config.topology == 2) corners = count >= 3 ? (count - 2) * 3 : 0;
   else corners = count / 3 * 3;
@@ -747,13 +767,25 @@ void Renderer::record(const pica::State& state, bool indexed) {
                         ? texture(state, unit, du.texture_size[unit], du.texture_border[unit], du.texture_lod[unit])
                         : empty_texture_;
   for (int unit = 0; unit < 3; ++unit) d.samplers[unit] = sampler(du.texture_size[unit][3]);
+  if (immediate) {
+    arena_.resize((arena_.size() + 3) & ~size_t{3}, 0);
+    const uint32_t at = static_cast<uint32_t>(arena_.size());
+    for (const auto& v : *immediate)
+      for (uint32_t id = 0; id < attributes; ++id) {
+        const auto* bytes = reinterpret_cast<const uint8_t*>(v[id].data());
+        arena_.insert(arena_.end(), bytes, bytes + 16);
+      }
+    du.loaders[0][0] = at;
+    du.loaders[0][1] = attributes * 16;
+    du.loaders[0][2] = attributes * 16;
+  }
   // vertices: the arrays from the lowest vertex named to the highest
-  const std::vector<uint32_t> names = vertex::vertices(state, memory_, indexed);
+  const std::vector<uint32_t> names = immediate ? std::vector<uint32_t>{} : vertex::vertices(state, memory_, indexed);
   uint32_t low = UINT32_MAX, high = 0;
   for (uint32_t i = 0; i < std::min<uint32_t>(count, static_cast<uint32_t>(names.size())); ++i)
     low = std::min(low, names[i]), high = std::max(high, names[i]);
   if (low > high) low = high = 0;
-  for (size_t l = 0; l < layout.loaders.size(); ++l) {
+  for (size_t l = 0; l < layout.loaders.size() && !immediate; ++l) {
     const auto& loader = layout.loaders[l];
     const uint32_t first = layout.base + loader.offset + low * loader.stride;
     const uint32_t span = (high - low) * loader.stride + loader.size;
@@ -767,7 +799,7 @@ void Renderer::record(const pica::State& state, bool indexed) {
     du.index[0] = arena_copy(layout.base + (r[0x227] & 0x0FFFFFFF), count * (wide ? 2 : 1));
     du.index[1] = wide;
   }
-  du.index[2] = r[0x22A];
+  du.index[2] = immediate ? 0 : r[0x22A];
   du.index[3] = count;
   for (int i = 0; i < 16; ++i) std::memcpy(du.defaults[i], layout.defaults[i].data(), 16);
   du.clip[0] = vw / static_cast<float>(width);
@@ -822,12 +854,15 @@ void Renderer::record(const pica::State& state, bool indexed) {
     ++stats_.skipped;
     return;
   }
-  Surface& color = surface(color_address, width, height, false);
+  // the color buffer's format: blending reads it at 8 bits a channel, as stored
+  // only when written back (shortcut: the console blends what the format kept)
+  Surface& color = surface(color_address, width, height, false,
+                           static_cast<uint32_t>(color_buffer_format(r[0x117] >> 16 & 7)));
   Surface& depth = surface(depth_address, width, height, true);
   load(color);
   load(depth);
-  if (!color.drawn) forget_textures(color.address, color.width * color.height * 4);
-  if (!depth.drawn) forget_textures(depth.address, depth.width * depth.height * 4);
+  if (!color.drawn) forget_textures(color.address, color.bytes());
+  if (!depth.drawn) forget_textures(depth.address, depth.bytes());
   color.drawn = depth.drawn = true;
   d.color = &color;
   d.depth = &depth;
@@ -1028,7 +1063,7 @@ void Renderer::write_back(uint32_t address, uint32_t size, bool forget) {
   deliver(address, size);
   std::vector<Surface*> back;
   for (auto& [key, s] : surfaces_) {
-    const uint32_t bytes = s->width * s->height * 4;
+    const uint32_t bytes = s->bytes();
     if (address < s->address + bytes && s->address < address + size) {
       if (s->drawn) back.push_back(s.get());
       if (forget) s->loaded = false;
@@ -1076,7 +1111,7 @@ void Renderer::memory_fill(uint32_t start, uint32_t end, uint32_t value, uint32_
   if (cached_ && width == 4) {
     // a whole surface: cleared on the GPU, memory gets it if anything reads it
     for (auto& [key, s] : surfaces_) {
-      if (s->address != start || start + s->width * s->height * 4 != end) continue;
+      if (s->address != start || start + s->bytes() != end || (!s->depth && s->format != ColorFormat::RGBA8)) continue;
       PendingDraw clear{};
       clear.clear = true;
       if (s->depth) {
@@ -1148,7 +1183,8 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   uint32_t first = 0;
   for (auto& [key, candidate] : surfaces_) {
     const uint32_t tile_line = width * 8 * 4;
-    if (candidate->depth || candidate->width != width || !candidate->loaded || input < candidate->address ||
+    if (candidate->depth || candidate->format != ColorFormat::RGBA8 || candidate->width != width || !candidate->loaded ||
+        input < candidate->address ||
         (input - candidate->address) % tile_line != 0)
       continue;
     const uint32_t line = (input - candidate->address) / tile_line * 8;

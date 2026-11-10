@@ -82,7 +82,8 @@ private:
   struct Texture;
   struct PendingDraw;
 
-  void record(const pica::State& state, bool indexed);
+  // a draw; with immediate, of those vertices rather than the arrays
+  void record(const pica::State& state, bool indexed, const std::vector<pica::CommandProcessor::Vertex>* immediate = nullptr);
   // runs the pending work; with write_back, every surface drawn goes back to memory
   void flush(bool write_back);
   // runs the pending work, and writes back the surfaces listed
@@ -97,7 +98,8 @@ private:
   // memory gets the GPU transfers on their way into a range (all of them with
   // the defaults), the oldest first
   void deliver(uint32_t address = 0, uint32_t size = UINT32_MAX);
-  Surface& surface(uint32_t address, uint32_t width, uint32_t height, bool depth);
+  // a color surface (in a color buffer format) or a depth one (D24S8)
+  Surface& surface(uint32_t address, uint32_t width, uint32_t height, bool depth, uint32_t format = 0);
   void load(Surface& surface);
   void store(Surface& surface, const std::vector<uint8_t>& data);
   wgpu::TextureView texture(const pica::State& state, int unit, uint32_t uniforms[4], float border[4], float lod[4]);
@@ -139,7 +141,7 @@ private:
   std::unordered_map<uint32_t, wgpu::Sampler> samplers_;
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
   std::unordered_map<std::string, wgpu::ShaderModule> modules_;
-  std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool>, std::unique_ptr<Surface>> surfaces_;
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool, uint32_t>, std::unique_ptr<Surface>> surfaces_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
   // cached mode: the texture each (address, format, size, levels) decoded to,
   // while its memory is unchanged

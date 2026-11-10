@@ -3,6 +3,7 @@
 #include "picanative/memory.hpp"
 
 #include <array>
+#include <vector>
 #include <cstdint>
 #include <functional>
 
@@ -79,10 +80,16 @@ public:
 
   // Called for each draw (indexed or not) with the state at that moment.
   std::function<void(const State&, bool indexed)> on_draw;
+  // Called with the vertices sent in immediate mode, each its attributes in
+  // order, once something else is written (the state they were sent under)
+  // or the command list ends.
+  using Vertex = std::array<Vec4, 16>;
+  std::function<void(const State&, const std::vector<Vertex>&)> on_immediate;
   uint64_t draws = 0, immediate_vertices = 0, command_lists = 0;
 
 private:
   void write(uint32_t reg, uint32_t value, uint32_t mask);
+  void flush_immediate();
   void configure(ShaderUnit& unit, uint32_t offset, uint32_t value);
   void upload_uniform(ShaderUnit& unit, uint32_t word);
 
@@ -90,6 +97,8 @@ private:
   State state_;
   uint32_t fixed_staging_[3] = {};
   uint32_t fixed_words_ = 0, immediate_next_ = 0;
+  Vertex attributes_{};
+  std::vector<Vertex> immediate_;
   bool jump_ = false;
   uint32_t jump_address_ = 0, jump_size_ = 0;
 };

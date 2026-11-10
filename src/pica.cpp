@@ -59,11 +59,23 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
       i = 0;
     }
   }
+  flush_immediate();
   ++command_lists;
+}
+
+void CommandProcessor::flush_immediate() {
+  if (immediate_.empty()) return;
+  std::vector<Vertex> vertices;
+  vertices.swap(immediate_);
+  ++draws;
+  if (on_immediate) on_immediate(state_, vertices);
 }
 
 void CommandProcessor::write(uint32_t reg, uint32_t value, uint32_t mask) {
   if (reg >= kRegisterCount) return;
+  // immediate vertices are drawn with the state they were sent under: any
+  // other write draws them first
+  if ((reg < kRegFixedAttributeData || reg > kRegFixedAttributeDataEnd) && !immediate_.empty()) flush_immediate();
   auto& regs = state_.regs;
   const uint32_t bits = byte_mask(mask);
   const uint32_t merged = (regs[reg] & ~bits) | (value & bits);
@@ -93,12 +105,13 @@ void CommandProcessor::write(uint32_t reg, uint32_t value, uint32_t mask) {
         state_.fixed_attributes[index] = attribute;
         regs[kRegFixedAttributeIndex] = (regs[kRegFixedAttributeIndex] & ~0xFu) | (index + 1);
       } else {
-        // immediate mode: the last attribute of a vertex completes it
-        // shortcut: immediate vertices are only counted for now (SM3DL sends some), drawn in G2
+        // immediate mode: attributes arrive in order, the last one completes a vertex
+        attributes_[immediate_next_ & 0xF] = attribute;
         if (immediate_next_ < (regs[kRegVsAttributeCount] & 0xF)) {
           ++immediate_next_;
         } else {
           immediate_next_ = 0;
+          immediate_.push_back(attributes_);
           ++immediate_vertices;
         }
       }
