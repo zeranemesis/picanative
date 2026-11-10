@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -82,6 +83,7 @@ int main(int argc, char** argv) {
   std::printf("GPU: %s\n", g.adapter_name.c_str());
   auto memory = std::make_unique<HostMemory>();
   Renderer renderer(g, *memory, cached, cached);
+  if (const char* scale = std::getenv("PN_SCALE")) renderer.set_scale(static_cast<uint32_t>(std::atoi(scale))); // internal resolution
   Screen screens[2];
   const auto started = std::chrono::steady_clock::now();
   uint32_t frame = 0, compared = 0;

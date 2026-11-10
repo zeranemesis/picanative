@@ -55,6 +55,10 @@ PN_API void pn_cpu_wrote(pn_engine* engine, uint32_t address, uint32_t size);
    no stall the first time a shader is met (the disk cache makes it once) */
 #define PN_ASYNC_PIPELINES 4u
 PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, uint32_t error_size);
+/* draws at this many times the console's resolution (1 to 8; 1, the default,
+   is the console's pixels exactly); before the first command list. Memory
+   always gets the console's pixels; the window shows the scaled pictures. */
+PN_API void pn_set_resolution_scale(pn_engine* engine, uint32_t scale);
 
 /* counters, for a status line: draws, pipelines, shader errors */
 PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);

@@ -65,6 +65,27 @@ fn five(c: u32) -> f32 { return f32((c << 3u) | (c >> 2u)) / 255.0; }
 pn_input last_input{};
 bool polled = false;
 
+// A picture the engine drew above the console's resolution: the lines a
+// transfer took from the surface, sampled straight (an LCD column is a line,
+// its rows run up the surface's columns). p.x: flipped.
+const char* kPictureWgsl = R"(
+@group(0) @binding(0) var picture: texture_2d<f32>;
+@group(0) @binding(1) var linear_sampler: sampler;
+@group(0) @binding(2) var<uniform> p: vec4u;
+struct V { @builtin(position) position: vec4f, @location(0) uv: vec2f, }
+@vertex fn vs(@builtin(vertex_index) i: u32) -> V {
+  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+  var v: V;
+  v.position = vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+  v.uv = uv;
+  return v;
+}
+@fragment fn fs(v: V) -> @location(0) vec4f {
+  let t = vec2f(1.0 - v.uv.y, select(v.uv.x, 1.0 - v.uv.x, p.x != 0u));
+  return vec4f(textureSampleLevel(picture, linear_sampler, t, 0.0).rgb, 1.0);
+}
+)";
+
 constexpr int kWidth = 400, kHeight = 480; // the top screen over the bottom one
 constexpr int kAudioRate = 32728;          // the DSP's, the CPU clock over 8192
 
@@ -77,7 +98,8 @@ struct pn_window {
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   int width = 0, height = 0;
   wgpu::PresentMode mode = wgpu::PresentMode::Fifo;
-  wgpu::RenderPipeline pipeline;
+  wgpu::RenderPipeline pipeline, picture_pipeline;
+  wgpu::Sampler smooth;
   wgpu::Buffer upload[2];
   uint32_t upload_size[2] = {};
   SDL_Gamepad* gamepad = nullptr;
@@ -168,6 +190,19 @@ pn_window* pn_window_open(pn_engine* engine, const char* title, uint32_t scale, 
   pd.vertex.entryPoint = "vs";
   pd.fragment = &fs;
   w->pipeline = g.device.CreateRenderPipeline(&pd);
+  {
+    wgpu::ShaderSourceWGSL picture_wgsl{};
+    picture_wgsl.code = kPictureWgsl;
+    wgpu::ShaderModuleDescriptor pmd{};
+    pmd.nextInChain = &picture_wgsl;
+    const wgpu::ShaderModule picture_module = g.device.CreateShaderModule(&pmd);
+    fs.module = picture_module;
+    pd.vertex.module = picture_module;
+    w->picture_pipeline = g.device.CreateRenderPipeline(&pd);
+    wgpu::SamplerDescriptor sd{};
+    sd.magFilter = sd.minFilter = wgpu::FilterMode::Linear;
+    w->smooth = g.device.CreateSampler(&sd);
+  }
 
   SDL_AudioSpec spec{SDL_AUDIO_S16, 2, kAudioRate};
   w->audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
@@ -216,6 +251,31 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     const uint32_t format = s.format & 7, bpp = format == 0 ? 4 : format == 1 ? 3 : 2;
     const uint32_t stride = s.stride ? s.stride : 240 * bpp, bytes = stride * lcd_width;
     if (s.address == 0) continue; // the LCD is off: the margins' grey
+    const float x = ox + (i == 0 ? 0 : 40) * scale, y = oy + (i == 0 ? 0 : 240) * scale;
+    // drawn above the console's resolution: that picture, straight
+    bool flipped = false;
+    if (const wgpu::TextureView view = renderer.picture_view(s.address, flipped)) {
+      const uint32_t parameters[4] = {flipped ? 1u : 0u, 0, 0, 0};
+      wgpu::BufferDescriptor ud{};
+      ud.size = sizeof parameters;
+      ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
+      const wgpu::Buffer uniform = g.device.CreateBuffer(&ud);
+      g.queue.WriteBuffer(uniform, 0, parameters, sizeof parameters);
+      wgpu::BindGroupEntry e[3] = {};
+      e[0].binding = 0, e[0].textureView = view;
+      e[1].binding = 1, e[1].sampler = w->smooth;
+      e[2].binding = 2, e[2].buffer = uniform, e[2].size = sizeof parameters;
+      wgpu::BindGroupDescriptor bd{};
+      bd.layout = w->picture_pipeline.GetBindGroupLayout(0);
+      bd.entryCount = 3;
+      bd.entries = e;
+      pass.SetPipeline(w->picture_pipeline);
+      pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
+      pass.SetViewport(x, y, lcd_width * scale, 240 * scale, 0, 1);
+      pass.Draw(3);
+      pass.SetPipeline(w->pipeline);
+      continue;
+    }
     // drawn by a transfer on the GPU: shown from there; otherwise from memory
     wgpu::Buffer source = renderer.picture(s.address, bytes);
     if (!source) {
@@ -250,7 +310,6 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     bd.entryCount = 2;
     bd.entries = e;
     pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
-    const float x = ox + (i == 0 ? 0 : 40) * scale, y = oy + (i == 0 ? 0 : 240) * scale;
     pass.SetViewport(x, y, lcd_width * scale, 240 * scale, 0, 1);
     pass.Draw(3);
   }

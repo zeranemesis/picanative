@@ -32,6 +32,8 @@ pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, 
 
 void pn_destroy(pn_engine* engine) { delete engine; }
 
+void pn_set_resolution_scale(pn_engine* e, uint32_t scale) { e->renderer->set_scale(scale); }
+
 void pn_command_list(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->command_list(address, size); }
 
 void pn_memory_fill(pn_engine* e, uint32_t start, uint32_t end, uint32_t value, uint32_t width) {

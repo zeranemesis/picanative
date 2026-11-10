@@ -59,6 +59,17 @@ public:
   // there since (as far as the renderer is told); null otherwise. A window
   // shows a screen from it without reading anything back.
   wgpu::Buffer picture(uint32_t address, uint32_t size) const;
+  // with a resolution scale: the picture at that resolution, as the surface
+  // it came from had it (flipped when the transfer flipped), or null
+  wgpu::TextureView picture_view(uint32_t address, bool& flip) const;
+
+  // draws at this many times the console's resolution (1, the default:
+  // exactly the console's pixels); to set before the first command list.
+  // Memory always gets the console's pixels (one sample per block).
+  void set_scale(uint32_t scale) {
+    if (surfaces_.empty()) scale_ = std::max(1u, std::min(scale, 8u));
+  }
+  uint32_t scale() const { return scale_; }
   gpu::Context& gpu() { return gpu_; }
 
   struct Stats {
@@ -113,6 +124,7 @@ private:
   Memory& memory_;
   bool cached_, trusted_;
   bool async_ = false;
+  uint32_t scale_ = 1;
   std::set<std::string> compiling_;
   std::vector<wgpu::Future> futures_;
   pica::CommandProcessor processor_;
@@ -136,6 +148,8 @@ private:
   struct Picture {
     uint32_t address, size;
     wgpu::Buffer buffer;
+    wgpu::TextureView view; // at the scale, when above 1
+    bool flip = false;
   };
   std::vector<Picture> pictures_;
   std::unordered_map<uint32_t, wgpu::Sampler> samplers_;

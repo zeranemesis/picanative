@@ -166,7 +166,8 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
   if (i >= p.w) { return; }
   let format = p.z & 0xFFu;
   let flip = ((p.z >> 8u) & 1u) != 0u;
-  let first = p.z >> 16u;
+  let first = (p.z >> 16u) & 1023u;
+  let scale = p.z >> 26u; // one sample per block of the scaled surface
   let bpp = select(2u, select(3u, 4u, format == 0u), format <= 1u);
   var word = 0u;
   for (var b = 0u; b < 4u; b++) {
@@ -175,7 +176,7 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
     if (pixel >= p.x * p.y) { break; }
     let line = pixel / p.x;
     let y = first + select(line, p.y - 1u - line, flip);
-    word |= ((encoded(pixel % p.x, y, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
+    word |= ((encoded((pixel % p.x) * scale, y * scale, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
   }
   output[i] = word;
 }
@@ -339,7 +340,7 @@ Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t 
     slot->address = address, slot->width = width, slot->height = height, slot->depth = depth;
     slot->format = static_cast<ColorFormat>(format);
     wgpu::TextureDescriptor td{};
-    td.size = {width, height, 1};
+    td.size = {width * scale_, height * scale_, 1};
     td.format = depth ? wgpu::TextureFormat::Depth32FloatStencil8 : wgpu::TextureFormat::RGBA8Unorm;
     td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
     if (!depth) td.usage |= wgpu::TextureUsage::TextureBinding; // read by the GPU transfers
@@ -356,6 +357,18 @@ void Renderer::load(Surface& s) {
   s.loaded = true;
   const uint32_t bpp = s.depth ? 4 : bytes_per_pixel(s.format);
   const uint8_t* bytes = memory_.map(s.address, s.width * s.height * bpp);
+  const uint32_t n = scale_, sw = s.width * n, sh = s.height * n;
+  // each of the console's pixels, repeated n x n
+  auto grow = [&](auto& small) {
+    if (n == 1) return small;
+    std::remove_reference_t<decltype(small)> big(size_t{sw} * sh * (small.size() / (size_t{s.width} * s.height)));
+    const size_t unit = small.size() / (size_t{s.width} * s.height);
+    for (uint32_t y = 0; y < sh; ++y)
+      for (uint32_t x = 0; x < sw; ++x)
+        std::memcpy(&big[(size_t{y} * sw + x) * unit], &small[(size_t{y / n} * s.width + x / n) * unit],
+                    unit * sizeof small[0]);
+    return big;
+  };
   if (!s.depth) {
     std::vector<uint8_t> rgba(size_t{s.width} * s.height * 4, 0);
     if (bytes)
@@ -364,13 +377,14 @@ void Renderer::load(Surface& s) {
           const Rgba c = decode(s.format, bytes + tiled_offset(x, y, s.width, bpp));
           std::memcpy(&rgba[(size_t{y} * s.width + x) * 4], c.data(), 4);
         }
+    const auto big = grow(rgba);
     wgpu::TexelCopyTextureInfo dst{};
     dst.texture = s.texture;
     wgpu::TexelCopyBufferLayout layout{};
-    layout.bytesPerRow = s.width * 4;
-    layout.rowsPerImage = s.height;
-    wgpu::Extent3D extent{s.width, s.height, 1};
-    gpu_.queue.WriteTexture(&dst, rgba.data(), rgba.size(), &layout, &extent);
+    layout.bytesPerRow = sw * 4;
+    layout.rowsPerImage = sh;
+    wgpu::Extent3D extent{sw, sh, 1};
+    gpu_.queue.WriteTexture(&dst, big.data(), big.size(), &layout, &extent);
     return;
   }
   // D24S8: the stencil straight into its aspect, the depth by a pass
@@ -384,22 +398,24 @@ void Renderer::load(Surface& s) {
         depth[size_t{y} * s.width + x] = word & 0xFFFFFF;
         stencil[size_t{y} * s.width + x] = static_cast<uint8_t>(word >> 24);
       }
+  const auto big_stencil = grow(stencil);
+  const auto big_depth = grow(depth);
   wgpu::TexelCopyTextureInfo dst{};
   dst.texture = s.texture;
   dst.aspect = wgpu::TextureAspect::StencilOnly;
   wgpu::TexelCopyBufferLayout layout{};
-  layout.bytesPerRow = s.width;
-  layout.rowsPerImage = s.height;
-  wgpu::Extent3D extent{s.width, s.height, 1};
-  gpu_.queue.WriteTexture(&dst, stencil.data(), stencil.size(), &layout, &extent);
+  layout.bytesPerRow = sw;
+  layout.rowsPerImage = sh;
+  wgpu::Extent3D extent{sw, sh, 1};
+  gpu_.queue.WriteTexture(&dst, big_stencil.data(), big_stencil.size(), &layout, &extent);
   PendingDraw upload{};
   upload.depth_upload = true;
   upload.depth = &s;
   // a storage binding starts on 256 bytes
   arena_.resize(align_up(static_cast<uint32_t>(arena_.size()), 256), 0);
   upload.upload_offset = static_cast<uint32_t>(arena_.size());
-  arena_.resize(arena_.size() + depth.size() * 4);
-  std::memcpy(arena_.data() + upload.upload_offset, depth.data(), depth.size() * 4);
+  arena_.resize(arena_.size() + big_depth.size() * 4);
+  std::memcpy(arena_.data() + upload.upload_offset, big_depth.data(), big_depth.size() * 4);
   pending_.push_back(upload);
 }
 
@@ -408,23 +424,24 @@ void Renderer::store(Surface& s, const std::vector<uint8_t>& data) {
   Timed timed{stats_.store};
   uint8_t* bytes = memory_.map(s.address, s.bytes());
   if (!bytes) return;
-  const uint32_t row = align_up(s.width * 4, 256);
+  // the readback is at the scale: one sample per block, its top left
+  const uint32_t n = scale_, row = align_up(s.width * n * 4, 256);
   if (!s.depth) {
     for (uint32_t y = 0; y < s.height; ++y)
       for (uint32_t x = 0; x < s.width; ++x) {
-        const uint8_t* c = &data[size_t{y} * row + x * 4];
+        const uint8_t* c = &data[size_t{y * n} * row + x * n * 4];
         encode(s.format, {c[0], c[1], c[2], c[3]}, bytes + tiled_offset(x, y, s.width, bytes_per_pixel(s.format)));
       }
     return;
   }
-  const uint32_t stencil_row = align_up(s.width, 256);
-  const size_t stencil_at = align_up(static_cast<uint32_t>(size_t{row} * s.height), 256);
+  const uint32_t stencil_row = align_up(s.width * n, 256);
+  const size_t stencil_at = align_up(static_cast<uint32_t>(size_t{row} * s.height * n), 256);
   for (uint32_t y = 0; y < s.height; ++y)
     for (uint32_t x = 0; x < s.width; ++x) {
       float d;
-      std::memcpy(&d, &data[size_t{y} * row + x * 4], 4);
+      std::memcpy(&d, &data[size_t{y * n} * row + x * n * 4], 4);
       const uint32_t d24 = static_cast<uint32_t>(std::clamp(d, 0.0f, 1.0f) * 16777215.0f);
-      const uint32_t word = d24 | uint32_t{data[stencil_at + size_t{y} * stencil_row + x]} << 24;
+      const uint32_t word = d24 | uint32_t{data[stencil_at + size_t{y * n} * stencil_row + x * n]} << 24;
       std::memcpy(bytes + tiled_offset(x, y, s.width, 4), &word, 4);
     }
 }
@@ -751,10 +768,10 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   }
 
   PendingDraw d{};
-  d.scissor[0] = left;
-  d.scissor[1] = config.upside_down ? bottom : height - top;
-  d.scissor[2] = right - left;
-  d.scissor[3] = top - bottom;
+  d.scissor[0] = left * scale_;
+  d.scissor[1] = (config.upside_down ? bottom : height - top) * scale_;
+  d.scissor[2] = (right - left) * scale_;
+  d.scissor[3] = (top - bottom) * scale_;
   d.vertex_count = corners;
   d.stencil_reference = r[0x105] >> 16 & 0xFF;
   unpack(r[0x103], d.blend_constant);
@@ -969,11 +986,11 @@ void Renderer::submit(const std::vector<Surface*>& back) {
     }
     if (d.depth_upload) {
       begin_pass(nullptr, d.depth);
-      const uint32_t size[4] = {d.depth->width, d.depth->height, 0, 0};
+      const uint32_t size[4] = {d.depth->width * scale_, d.depth->height * scale_, 0, 0};
       const wgpu::Buffer size_buffer = make_buffer(gpu_, size, sizeof size, wgpu::BufferUsage::Uniform);
       wgpu::BindGroupEntry e[2] = {};
       e[0].binding = 0, e[0].buffer = arena, e[0].offset = d.upload_offset,
-      e[0].size = size_t{d.depth->width} * d.depth->height * 4;
+      e[0].size = size_t{d.depth->width * scale_} * d.depth->height * scale_ * 4;
       e[1].binding = 1, e[1].buffer = size_buffer, e[1].size = 16;
       wgpu::BindGroupDescriptor bd{};
       bd.layout = depth_upload_layout_;
@@ -1007,12 +1024,13 @@ void Renderer::submit(const std::vector<Surface*>& back) {
   };
   std::vector<Readback> readbacks;
   for (Surface* s : back) {
-    const uint32_t row = align_up(s->width * 4, 256);
-    uint64_t size = uint64_t{row} * s->height;
+    const uint32_t sw = s->width * scale_, sh = s->height * scale_;
+    const uint32_t row = align_up(sw * 4, 256);
+    uint64_t size = uint64_t{row} * sh;
     uint64_t stencil_at = 0;
     if (s->depth) {
       stencil_at = align_up(static_cast<uint32_t>(size), 256);
-      size = stencil_at + uint64_t{align_up(s->width, 256)} * s->height;
+      size = stencil_at + uint64_t{align_up(sw, 256)} * sh;
     }
     wgpu::BufferDescriptor bdesc{};
     bdesc.size = align_up(static_cast<uint32_t>(size), 4);
@@ -1024,13 +1042,13 @@ void Renderer::submit(const std::vector<Surface*>& back) {
     wgpu::TexelCopyBufferInfo dst{};
     dst.buffer = buffer;
     dst.layout.bytesPerRow = row;
-    dst.layout.rowsPerImage = s->height;
-    wgpu::Extent3D extent{s->width, s->height, 1};
+    dst.layout.rowsPerImage = sh;
+    wgpu::Extent3D extent{sw, sh, 1};
     encoder.CopyTextureToBuffer(&src, &dst, &extent);
     if (s->depth) {
       src.aspect = wgpu::TextureAspect::StencilOnly;
       dst.layout.offset = stencil_at;
-      dst.layout.bytesPerRow = align_up(s->width, 256);
+      dst.layout.bytesPerRow = align_up(sw, 256);
       encoder.CopyTextureToBuffer(&src, &dst, &extent);
     }
     readbacks.push_back({s, buffer, bdesc.size});
@@ -1206,7 +1224,7 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   const wgpu::Buffer out = gpu_.device.CreateBuffer(&bd);
   bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
   const wgpu::Buffer back = gpu_.device.CreateBuffer(&bd);
-  const uint32_t parameters[4] = {out_width, out_height, static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8 | first << 16, words};
+  const uint32_t parameters[4] = {out_width, out_height, static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8 | first << 16 | scale_ << 26, words};
   const wgpu::Buffer uniform = make_buffer(gpu_, parameters, sizeof parameters, wgpu::BufferUsage::Uniform);
   const wgpu::TextureView view = s.texture.CreateView();
   wgpu::BindGroupEntry e[3] = {};
@@ -1230,13 +1248,39 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   ++stats_.gpu_transfers;
 
   // write_back(output) delivered what overlapped: deliveries never overlap
-  pictures_.push_back({output, bytes, out});
+  wgpu::TextureView scaled;
+  if (scale_ > 1) { // what the window shows: the lines transferred, at the scale
+    wgpu::TextureDescriptor td{};
+    td.size = {width * scale_, out_height * scale_, 1};
+    td.format = wgpu::TextureFormat::RGBA8Unorm;
+    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+    const wgpu::Texture copy = gpu_.device.CreateTexture(&td);
+    wgpu::TexelCopyTextureInfo from{}, to{};
+    from.texture = s.texture;
+    from.origin = {0, first * scale_, 0};
+    to.texture = copy;
+    const wgpu::CommandEncoder copier = gpu_.device.CreateCommandEncoder();
+    copier.CopyTextureToTexture(&from, &to, &td.size);
+    const wgpu::CommandBuffer copied = copier.Finish();
+    gpu_.queue.Submit(1, &copied);
+    scaled = copy.CreateView();
+  }
+  pictures_.push_back({output, bytes, out, scaled, flip});
   deliveries_.push_back({output, bytes, back,
                          back.MapAsync(wgpu::MapMode::Read, 0, bd.size, wgpu::CallbackMode::WaitAnyOnly,
                                        [](wgpu::MapAsyncStatus, wgpu::StringView) {})});
   // shortcut: a host that never reads its pictures back keeps up to 16 on the way
   if (deliveries_.size() > 16) deliver(deliveries_.front().address, 1);
   return true;
+}
+
+wgpu::TextureView Renderer::picture_view(uint32_t address, bool& flip) const {
+  for (const Picture& p : pictures_)
+    if (p.address == address && p.view) {
+      flip = p.flip;
+      return p.view;
+    }
+  return nullptr;
 }
 
 wgpu::Buffer Renderer::picture(uint32_t address, uint32_t size) const {
