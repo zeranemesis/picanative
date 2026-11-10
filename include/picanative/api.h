@@ -130,6 +130,15 @@ PN_API void pn_window_set_layout(pn_window* window, int layout);
    any window polled */
 PN_API int pn_input_now(pn_input* input);
 
+/* Android: a second display (a dual-screen handheld's lower screen). The
+   app hands over the native window (an ANativeWindow* it acquired; picanative
+   releases it) of a surface on that display, null when the surface goes away
+   (call before returning from surfaceDestroyed): the bottom screen is drawn
+   there and the main window shows the top one. Then its touches, across the
+   surface (0..1). Any thread. */
+PN_API void pn_android_second_screen(void* native_window);
+PN_API void pn_android_second_touch(int down, float u, float v);
+
 #ifdef __cplusplus
 }
 #endif

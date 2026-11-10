@@ -12,12 +12,30 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
+
+#if defined(__ANDROID__)
+#include <android/native_window.h>
+#endif
 
 using namespace picanative;
 
 namespace {
+
+#if defined(__ANDROID__)
+// A second display (the AYN Thor's lower screen): its native window, which
+// the app's Java side hands over (pn_android_second_screen); the console's
+// bottom screen goes there and the main window keeps the top one.
+struct Second {
+  std::mutex lock; // held while the window draws into it, or changes it
+  ANativeWindow* given = nullptr;
+  bool changed = false;
+  bool touching = false;
+  float u = 0, v = 0; // the finger, across the display (0..1)
+} second;
+#endif
 
 // The LCD as the console scans it: a framebuffer is column-major, each
 // column a line of 240 pixels from the bottom up (zakuro's read_screen).
@@ -115,10 +133,28 @@ struct pn_window {
   struct Rect {
     float x, y, w, h;
   };
+#if defined(__ANDROID__)
+  ANativeWindow* second_window = nullptr;
+  wgpu::Surface second_surface;
+  int second_width = 0, second_height = 0;
+  bool second_on() const { return second_surface != nullptr; }
+#else
+  bool second_on() const { return false; }
+#endif
+  // the bottom screen on the second display, as large as it allows, centred
+  Rect second_place() const {
+#if defined(__ANDROID__)
+    const float scale = std::min(second_width / 320.0f, second_height / 240.0f);
+    return {(second_width - 320 * scale) / 2, (second_height - 240 * scale) / 2, 320 * scale, 240 * scale};
+#else
+    return {0, 0, 0, 0};
+#endif
+  }
   void screens(Rect out[2]) const {
     Rect top{0, 0, 400, 240}, bottom{40, 240, 320, 240};
     float cw = 400, ch = 480;
-    switch (layout) {
+    // with a second display, the bottom screen is there
+    switch (second_on() ? PN_LAYOUT_TOP_ONLY : layout) {
     case PN_LAYOUT_SIDE_BY_SIDE: bottom = {400, 0, 320, 240}, cw = 720, ch = 240; break;
     case PN_LAYOUT_LARGE_TOP: bottom = {400, 120, 160, 120}, cw = 560, ch = 240; break; // the bottom at half size
     case PN_LAYOUT_TOP_ONLY: bottom = {0, 0, 0, 0}, cw = 400, ch = 240; break;
@@ -146,6 +182,7 @@ struct pn_window {
     wgpu::SurfaceSourceAndroidNativeWindow source{};
     source.window = SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
     if (!source.window) return false;
+    native = source.window;
 #else
 #error "picanative's window: no surface for this platform yet"
 #endif
@@ -172,6 +209,72 @@ struct pn_window {
     if (surface) surface.Unconfigure();
     surface = nullptr;
   }
+
+#if defined(__ANDROID__)
+  void* native = nullptr; // the native window the surface is on
+  // the focus back: a surface again if the old one was lost, or on the
+  // window Android made meanwhile (one window takes one surface at a time)
+  void reattach() {
+    void* now = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+    if (surface && now == native) return;
+    detach();
+    attach();
+  }
+  // the second display's window changed (second.lock held): let the old one
+  // go, without touching it (it may be gone), and draw into the new one
+  void second_change() {
+    if (second.given && second.given == second_window && second_surface) {
+      // the same window, resized: one window takes one surface at a time
+      ANativeWindow_release(second.given);
+      second.given = nullptr;
+      second.changed = false;
+      second_width = ANativeWindow_getWidth(second_window);
+      second_height = ANativeWindow_getHeight(second_window);
+      second_configure();
+      return;
+    }
+    if (second_surface) second_surface.Unconfigure();
+    second_surface = nullptr;
+    if (second_window) ANativeWindow_release(second_window);
+    second_window = second.given;
+    second.given = nullptr;
+    second.changed = false;
+    if (!second_window) return;
+    gpu::Context& g = engine->gpu;
+    wgpu::SurfaceSourceAndroidNativeWindow source{};
+    source.window = second_window;
+    wgpu::SurfaceDescriptor sd{};
+    sd.nextInChain = &source;
+    wgpu::Surface made = g.instance.CreateSurface(&sd);
+    wgpu::SurfaceCapabilities capabilities;
+    if (!made || !made.GetCapabilities(g.adapter, &capabilities)) return;
+    // the same format as the main window's: its pipelines draw there too
+    bool format_ok = false, mailbox = false;
+    for (size_t i = 0; i < capabilities.formatCount; ++i) format_ok |= capabilities.formats[i] == format;
+    for (size_t i = 0; i < capabilities.presentModeCount; ++i)
+      mailbox |= capabilities.presentModes[i] == wgpu::PresentMode::Mailbox;
+    if (!format_ok) {
+      std::fprintf(stderr, "picanative: the second display does not take the main window's format\n");
+      return;
+    }
+    second_width = ANativeWindow_getWidth(second_window);
+    second_height = ANativeWindow_getHeight(second_window);
+    // the main window paces the frames: this one does not wait a second time
+    second_mode = mailbox ? wgpu::PresentMode::Mailbox : wgpu::PresentMode::Fifo;
+    second_surface = made;
+    second_configure();
+  }
+  wgpu::PresentMode second_mode = wgpu::PresentMode::Fifo;
+  void second_configure() {
+    wgpu::SurfaceConfiguration config{};
+    config.device = engine->gpu.device;
+    config.format = format;
+    config.width = static_cast<uint32_t>(std::max(second_width, 1));
+    config.height = static_cast<uint32_t>(std::max(second_height, 1));
+    config.presentMode = second_mode;
+    second_surface.Configure(&config);
+  }
+#endif
 
   void configure() {
     if (!surface) return;
@@ -275,31 +378,17 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     w->configure(); // resized: the next frame shows
     return;
   }
-  const wgpu::TextureView view = frame.texture.CreateView();
-  const wgpu::CommandEncoder encoder = g.device.CreateCommandEncoder();
-  wgpu::RenderPassColorAttachment ca{};
-  ca.view = view;
-  ca.loadOp = wgpu::LoadOp::Clear;
-  ca.storeOp = wgpu::StoreOp::Store;
-  ca.clearValue = {0.094, 0.094, 0.094, 1.0}; // the margins, dark grey
-  wgpu::RenderPassDescriptor rp{};
-  rp.colorAttachmentCount = 1;
-  rp.colorAttachments = &ca;
-  const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&rp);
-  pass.SetPipeline(w->pipeline);
-  pn_window::Rect places[2];
-  w->screens(places);
-  for (int i = 0; i < 2; ++i) {
-    if (places[i].w <= 0) continue; // hidden in this layout
+  // one screen into a pass, at a place in its target
+  auto draw = [&](const wgpu::RenderPassEncoder& pass, int i, const pn_window::Rect& place) {
+    if (place.w <= 0) return; // hidden in this layout
     const pn_screen& s = screens[i];
     const uint32_t lcd_width = i == 0 ? 400 : 320;
     const uint32_t format = s.format & 7, bpp = format == 0 ? 4 : format == 1 ? 3 : 2;
     const uint32_t stride = s.stride ? s.stride : 240 * bpp, bytes = stride * lcd_width;
-    if (s.address == 0) continue; // the LCD is off: the margins' grey
-    const float x = places[i].x, y = places[i].y;
+    if (s.address == 0) return; // the LCD is off: the margins' grey
     // drawn above the console's resolution: that picture, straight
     bool flipped = false;
-    if (const wgpu::TextureView view = renderer.picture_view(s.address, flipped)) {
+    if (const wgpu::TextureView picture = renderer.picture_view(s.address, flipped)) {
       const uint32_t parameters[4] = {flipped ? 1u : 0u, 0, 0, 0};
       wgpu::BufferDescriptor ud{};
       ud.size = sizeof parameters;
@@ -307,7 +396,7 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
       const wgpu::Buffer uniform = g.device.CreateBuffer(&ud);
       g.queue.WriteBuffer(uniform, 0, parameters, sizeof parameters);
       wgpu::BindGroupEntry e[3] = {};
-      e[0].binding = 0, e[0].textureView = view;
+      e[0].binding = 0, e[0].textureView = picture;
       e[1].binding = 1, e[1].sampler = w->smooth;
       e[2].binding = 2, e[2].buffer = uniform, e[2].size = sizeof parameters;
       wgpu::BindGroupDescriptor bd{};
@@ -316,10 +405,9 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
       bd.entries = e;
       pass.SetPipeline(w->picture_pipeline);
       pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
-      pass.SetViewport(x, y, places[i].w, places[i].h, 0, 1);
+      pass.SetViewport(place.x, place.y, place.w, place.h, 0, 1);
       pass.Draw(3);
-      pass.SetPipeline(w->pipeline);
-      continue;
+      return;
     }
     // drawn by a transfer on the GPU: shown from there; otherwise from memory
     wgpu::Buffer source = renderer.picture(s.address, bytes);
@@ -354,13 +442,55 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     bd.layout = w->pipeline.GetBindGroupLayout(0);
     bd.entryCount = 2;
     bd.entries = e;
+    pass.SetPipeline(w->pipeline);
     pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
-    pass.SetViewport(x, y, places[i].w, places[i].h, 0, 1);
+    pass.SetViewport(place.x, place.y, place.w, place.h, 0, 1);
     pass.Draw(3);
+  };
+  // a frame's screens into a target, the margins dark grey
+  auto frame_pass = [&](const wgpu::Texture& target, auto&& fill) {
+    const wgpu::CommandEncoder encoder = g.device.CreateCommandEncoder();
+    wgpu::RenderPassColorAttachment ca{};
+    ca.view = target.CreateView();
+    ca.loadOp = wgpu::LoadOp::Clear;
+    ca.storeOp = wgpu::StoreOp::Store;
+    ca.clearValue = {0.094, 0.094, 0.094, 1.0};
+    wgpu::RenderPassDescriptor rp{};
+    rp.colorAttachmentCount = 1;
+    rp.colorAttachments = &ca;
+    const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&rp);
+    fill(pass);
+    pass.End();
+    const wgpu::CommandBuffer commands = encoder.Finish();
+    g.queue.Submit(1, &commands);
+  };
+
+#if defined(__ANDROID__)
+  // the second display first: whether it is there decides the main layout
+  {
+    std::lock_guard<std::mutex> hold(second.lock);
+    if (second.changed) w->second_change();
+    if (w->second_surface) {
+      wgpu::SurfaceTexture lower;
+      w->second_surface.GetCurrentTexture(&lower);
+      if (lower.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
+          lower.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
+        frame_pass(lower.texture, [&](const wgpu::RenderPassEncoder& pass) { draw(pass, 1, w->second_place()); });
+        w->second_surface.Present();
+      } else if (lower.status == wgpu::SurfaceGetCurrentTextureStatus::Lost) {
+        // its window went away: never configure it again (that loses the device)
+        w->second_surface.Unconfigure();
+        w->second_surface = nullptr;
+      }
+    }
   }
-  pass.End();
-  const wgpu::CommandBuffer commands = encoder.Finish();
-  g.queue.Submit(1, &commands);
+#endif
+
+  frame_pass(frame.texture, [&](const wgpu::RenderPassEncoder& pass) {
+    pn_window::Rect places[2];
+    w->screens(places);
+    for (int i = 0; i < 2; ++i) draw(pass, i, places[i]);
+  });
   w->surface.Present();
 }
 
@@ -386,10 +516,7 @@ int pn_window_poll(pn_window* w, pn_input* input) {
     // Android destroys the native window in the background (present lets the
     // lost surface go) and makes another before the focus comes back: a
     // surface on that one. Its app events do not reach this loop.
-    case SDL_EVENT_WINDOW_FOCUS_GAINED:
-      w->detach();
-      w->attach();
-      break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED: w->reattach(); break;
 #endif
     case SDL_EVENT_GAMEPAD_ADDED:
       if (!w->gamepad) w->gamepad = SDL_OpenGamepad(event.gdevice.which);
@@ -484,6 +611,18 @@ int pn_window_poll(pn_window* w, pn_input* input) {
       in.touch_x = static_cast<uint16_t>(x), in.touch_y = static_cast<uint16_t>(y);
     }
   }
+#if defined(__ANDROID__)
+  // the bottom screen on the second display: its touches
+  if (w->second_on()) {
+    std::lock_guard<std::mutex> hold(second.lock);
+    const pn_window::Rect b = w->second_place();
+    const float x = (second.u * w->second_width - b.x) / b.w * 320, y = (second.v * w->second_height - b.y) / b.h * 240;
+    if (second.touching && x >= 0 && x < 320 && y >= 0 && y < 240) {
+      in.touching = 1;
+      in.touch_x = static_cast<uint16_t>(x), in.touch_y = static_cast<uint16_t>(y);
+    }
+  }
+#endif
   *input = in;
   last_input = in, polled = true;
   return open ? 1 : 0;
@@ -494,6 +633,21 @@ int pn_input_now(pn_input* input) {
   *input = last_input;
   return 1;
 }
+
+#if defined(__ANDROID__)
+void pn_android_second_screen(void* native_window) {
+  std::lock_guard<std::mutex> hold(second.lock);
+  if (second.given) ANativeWindow_release(second.given);
+  second.given = static_cast<ANativeWindow*>(native_window);
+  second.changed = true;
+  second.touching = false;
+}
+
+void pn_android_second_touch(int down, float u, float v) {
+  std::lock_guard<std::mutex> hold(second.lock);
+  second.touching = down != 0, second.u = u, second.v = v;
+}
+#endif
 
 void pn_window_audio(pn_window* w, const int16_t* samples, uint32_t frames) {
   if (!w->audio || frames == 0) return;
