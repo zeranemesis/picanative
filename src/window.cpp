@@ -108,10 +108,30 @@ struct pn_window {
   float touch_x = 0, touch_y = 0; // window pixels
 
   // where the screens go in the window, letterboxed at its aspect
-  void layout(float& x, float& y, float& scale) const {
-    scale = std::min(width / float(kWidth), height / float(kHeight));
-    x = (width - kWidth * scale) / 2, y = (height - kHeight * scale) / 2;
+  // where the screens go in the window: each layout's own arrangement (in
+  // the console's pixels), as large as the window allows, centred; a hidden
+  // screen has no size
+  int layout = PN_LAYOUT_STACKED;
+  struct Rect {
+    float x, y, w, h;
+  };
+  void screens(Rect out[2]) const {
+    Rect top{0, 0, 400, 240}, bottom{40, 240, 320, 240};
+    float cw = 400, ch = 480;
+    switch (layout) {
+    case PN_LAYOUT_SIDE_BY_SIDE: bottom = {400, 0, 320, 240}, cw = 720, ch = 240; break;
+    case PN_LAYOUT_LARGE_TOP: bottom = {400, 120, 160, 120}, cw = 560, ch = 240; break; // the bottom at half size
+    case PN_LAYOUT_TOP_ONLY: bottom = {0, 0, 0, 0}, cw = 400, ch = 240; break;
+    default: break;
+    }
+    const float scale = std::min(width / cw, height / ch);
+    const float ox = (width - cw * scale) / 2, oy = (height - ch * scale) / 2;
+    for (int i = 0; i < 2; ++i) {
+      const Rect& r = i ? bottom : top;
+      out[i] = {ox + r.x * scale, oy + r.y * scale, r.w * scale, r.h * scale};
+    }
   }
+  bool fullscreen = false;
 
   void configure() {
     SDL_GetWindowSizeInPixels(window, &width, &height);
@@ -243,15 +263,16 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
   rp.colorAttachments = &ca;
   const wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&rp);
   pass.SetPipeline(w->pipeline);
-  float ox, oy, scale;
-  w->layout(ox, oy, scale);
+  pn_window::Rect places[2];
+  w->screens(places);
   for (int i = 0; i < 2; ++i) {
+    if (places[i].w <= 0) continue; // hidden in this layout
     const pn_screen& s = screens[i];
     const uint32_t lcd_width = i == 0 ? 400 : 320;
     const uint32_t format = s.format & 7, bpp = format == 0 ? 4 : format == 1 ? 3 : 2;
     const uint32_t stride = s.stride ? s.stride : 240 * bpp, bytes = stride * lcd_width;
     if (s.address == 0) continue; // the LCD is off: the margins' grey
-    const float x = ox + (i == 0 ? 0 : 40) * scale, y = oy + (i == 0 ? 0 : 240) * scale;
+    const float x = places[i].x, y = places[i].y;
     // drawn above the console's resolution: that picture, straight
     bool flipped = false;
     if (const wgpu::TextureView view = renderer.picture_view(s.address, flipped)) {
@@ -271,7 +292,7 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
       bd.entries = e;
       pass.SetPipeline(w->picture_pipeline);
       pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
-      pass.SetViewport(x, y, lcd_width * scale, 240 * scale, 0, 1);
+      pass.SetViewport(x, y, places[i].w, places[i].h, 0, 1);
       pass.Draw(3);
       pass.SetPipeline(w->pipeline);
       continue;
@@ -310,7 +331,7 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     bd.entryCount = 2;
     bd.entries = e;
     pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
-    pass.SetViewport(x, y, lcd_width * scale, 240 * scale, 0, 1);
+    pass.SetViewport(x, y, places[i].w, places[i].h, 0, 1);
     pass.Draw(3);
   }
   pass.End();
@@ -328,6 +349,13 @@ int pn_window_poll(pn_window* w, pn_input* input) {
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED: open = false; break;
     case SDL_EVENT_KEY_DOWN:
       if (event.key.key == SDLK_ESCAPE) open = false;
+      // F10: the next layout; F11 or Alt+Enter: full screen
+      if (event.key.key == SDLK_F10 && !event.key.repeat) w->layout = (w->layout + 1) % 4;
+      if ((event.key.key == SDLK_F11 || (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT))) &&
+          !event.key.repeat) {
+        w->fullscreen = !w->fullscreen;
+        SDL_SetWindowFullscreen(w->window, w->fullscreen);
+      }
       break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: w->configure(); break;
     case SDL_EVENT_GAMEPAD_ADDED:
@@ -414,9 +442,10 @@ int pn_window_poll(pn_window* w, pn_input* input) {
   in.circle_x = std::clamp(cx, -1.0f, 1.0f), in.circle_y = std::clamp(cy, -1.0f, 1.0f);
 
   if (w->touching) {
-    float ox, oy, scale;
-    w->layout(ox, oy, scale);
-    const float x = (w->touch_x - ox) / scale - 40, y = (w->touch_y - oy) / scale - 240;
+    pn_window::Rect places[2];
+    w->screens(places);
+    const pn_window::Rect& b = places[1];
+    const float x = b.w > 0 ? (w->touch_x - b.x) / b.w * 320 : -1, y = b.h > 0 ? (w->touch_y - b.y) / b.h * 240 : -1;
     if (x >= 0 && x < 320 && y >= 0 && y < 240) {
       in.touching = 1;
       in.touch_x = static_cast<uint16_t>(x), in.touch_y = static_cast<uint16_t>(y);
@@ -442,6 +471,17 @@ void pn_window_audio(pn_window* w, const int16_t* samples, uint32_t frames) {
 }
 
 void pn_window_title(pn_window* w, const char* title) { SDL_SetWindowTitle(w->window, title); }
+
+void pn_window_set_layout(pn_window* w, int layout) {
+  w->layout = std::clamp(layout, 0, 3);
+  if (w->fullscreen) return;
+  // the window takes the layout's shape, at the scale it was opened with
+  static const int sizes[4][2] = {{400, 480}, {720, 240}, {560, 240}, {400, 240}};
+  int width = 0, height = 0;
+  SDL_GetWindowSize(w->window, &width, &height);
+  const int scale = std::max(1, (width + 200) / 400);
+  SDL_SetWindowSize(w->window, sizes[w->layout][0] * scale, sizes[w->layout][1] * scale);
+}
 
 void pn_window_set_vsync(pn_window* w, int on) {
   w->mode = wgpu::PresentMode::Fifo;

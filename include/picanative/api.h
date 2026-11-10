@@ -116,6 +116,15 @@ PN_API void pn_window_title(pn_window* window, const char* title);
 /* 1 (the default): presenting waits for the display; 0: it does not, for a
    host that paces its frames itself */
 PN_API void pn_window_set_vsync(pn_window* window, int on);
+/* how the two screens share the window (F10 cycles them, F11 or Alt+Enter
+   toggles full screen): the console's, one over the other; side by side; a
+   large top screen with the bottom one at half size beside it; the top one
+   alone (touch is then off) */
+#define PN_LAYOUT_STACKED 0
+#define PN_LAYOUT_SIDE_BY_SIDE 1
+#define PN_LAYOUT_LARGE_TOP 2
+#define PN_LAYOUT_TOP_ONLY 3
+PN_API void pn_window_set_layout(pn_window* window, int layout);
 /* the inputs the last pn_window_poll read, for code that reads them on its
    own (a game's platform layer finding this export at run time); 0 before
    any window polled */
