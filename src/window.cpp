@@ -133,7 +133,48 @@ struct pn_window {
   }
   bool fullscreen = false;
 
+  // a surface on the window's native window; Android takes it away in the
+  // background and gives another back (attach again then)
+  bool attach() {
+    gpu::Context& g = engine->gpu;
+    const SDL_PropertiesID properties = SDL_GetWindowProperties(window);
+#if defined(_WIN32)
+    wgpu::SurfaceSourceWindowsHWND source{};
+    source.hwnd = SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    source.hinstance = SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, nullptr);
+#elif defined(__ANDROID__)
+    wgpu::SurfaceSourceAndroidNativeWindow source{};
+    source.window = SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+    if (!source.window) return false;
+#else
+#error "picanative's window: no surface for this platform yet"
+#endif
+    wgpu::SurfaceDescriptor sd{};
+    sd.nextInChain = &source;
+    surface = g.instance.CreateSurface(&sd);
+    wgpu::SurfaceCapabilities capabilities;
+    if (!surface || !surface.GetCapabilities(g.adapter, &capabilities) || capabilities.formatCount == 0) {
+      surface = nullptr;
+      return false;
+    }
+    // the screens' colors as they are: a format that does not convert them to sRGB
+    format = capabilities.formats[0];
+    for (size_t i = 0; i < capabilities.formatCount; ++i)
+      if (capabilities.formats[i] == wgpu::TextureFormat::BGRA8Unorm ||
+          capabilities.formats[i] == wgpu::TextureFormat::RGBA8Unorm) {
+        format = capabilities.formats[i];
+        break;
+      }
+    configure();
+    return true;
+  }
+  void detach() {
+    if (surface) surface.Unconfigure();
+    surface = nullptr;
+  }
+
   void configure() {
+    if (!surface) return;
     SDL_GetWindowSizeInPixels(window, &width, &height);
     wgpu::SurfaceConfiguration config{};
     config.device = engine->gpu.device;
@@ -163,35 +204,11 @@ pn_window* pn_window_open(pn_engine* engine, const char* title, uint32_t scale, 
     return fail(SDL_GetError());
   }
   gpu::Context& g = engine->gpu;
-  const SDL_PropertiesID properties = SDL_GetWindowProperties(w->window);
-#if defined(_WIN32)
-  wgpu::SurfaceSourceWindowsHWND source{};
-  source.hwnd = SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
-  source.hinstance = SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, nullptr);
-#elif defined(__ANDROID__)
-  wgpu::SurfaceSourceAndroidNativeWindow source{};
-  source.window = SDL_GetPointerProperty(properties, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
-#else
-#error "picanative's window: no surface for this platform yet"
-#endif
-  wgpu::SurfaceDescriptor sd{};
-  sd.nextInChain = &source;
-  w->surface = g.instance.CreateSurface(&sd);
-  wgpu::SurfaceCapabilities capabilities;
-  if (!w->surface || !w->surface.GetCapabilities(g.adapter, &capabilities) || capabilities.formatCount == 0) {
+  if (!w->attach()) {
     SDL_DestroyWindow(w->window);
     delete w;
     return fail("the GPU cannot draw into this window");
   }
-  // the screens' colors as they are: a format that does not convert them to sRGB
-  w->format = capabilities.formats[0];
-  for (size_t i = 0; i < capabilities.formatCount; ++i)
-    if (capabilities.formats[i] == wgpu::TextureFormat::BGRA8Unorm ||
-        capabilities.formats[i] == wgpu::TextureFormat::RGBA8Unorm) {
-      w->format = capabilities.formats[i];
-      break;
-    }
-  w->configure();
 
   wgpu::ShaderSourceWGSL wgsl{};
   wgsl.code = kPresentWgsl;
@@ -244,11 +261,18 @@ void pn_window_close(pn_window* w) {
 void pn_window_present(pn_window* w, const pn_screen screens[2]) {
   gpu::Context& g = w->engine->gpu;
   Renderer& renderer = *w->engine->renderer;
+  if (!w->surface) return; // in the background (Android): no window to draw into
   wgpu::SurfaceTexture frame;
   w->surface.GetCurrentTexture(&frame);
   if (frame.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal &&
       frame.status != wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
-    w->configure(); // resized, or lost: the next frame shows
+    // lost: Android took the window away; configuring a lost surface loses
+    // the GPU device, so let it go until the window has the focus again
+    if (frame.status == wgpu::SurfaceGetCurrentTextureStatus::Lost) {
+      w->detach();
+      return;
+    }
+    w->configure(); // resized: the next frame shows
     return;
   }
   const wgpu::TextureView view = frame.texture.CreateView();
@@ -358,6 +382,15 @@ int pn_window_poll(pn_window* w, pn_input* input) {
       }
       break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: w->configure(); break;
+#if defined(__ANDROID__)
+    // Android destroys the native window in the background (present lets the
+    // lost surface go) and makes another before the focus comes back: a
+    // surface on that one. Its app events do not reach this loop.
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+      w->detach();
+      w->attach();
+      break;
+#endif
     case SDL_EVENT_GAMEPAD_ADDED:
       if (!w->gamepad) w->gamepad = SDL_OpenGamepad(event.gdevice.which);
       break;
@@ -486,7 +519,7 @@ void pn_window_set_layout(pn_window* w, int layout) {
 void pn_window_set_vsync(pn_window* w, int on) {
   w->mode = wgpu::PresentMode::Fifo;
   wgpu::SurfaceCapabilities capabilities;
-  if (!on && w->surface.GetCapabilities(w->engine->gpu.adapter, &capabilities)) {
+  if (!on && w->surface && w->surface.GetCapabilities(w->engine->gpu.adapter, &capabilities)) {
     // without waiting for the display: Mailbox (no tearing) when there is one
     for (size_t i = 0; i < capabilities.presentModeCount; ++i)
       if (capabilities.presentModes[i] == wgpu::PresentMode::Mailbox) w->mode = wgpu::PresentMode::Mailbox;
