@@ -76,6 +76,7 @@ struct pn_window {
   wgpu::Surface surface;
   wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
   int width = 0, height = 0;
+  wgpu::PresentMode mode = wgpu::PresentMode::Fifo;
   wgpu::RenderPipeline pipeline;
   wgpu::Buffer upload[2];
   uint32_t upload_size[2] = {};
@@ -97,7 +98,7 @@ struct pn_window {
     config.format = format;
     config.width = static_cast<uint32_t>(std::max(width, 1));
     config.height = static_cast<uint32_t>(std::max(height, 1));
-    config.presentMode = wgpu::PresentMode::Fifo; // paced by the display, as the console is
+    config.presentMode = mode; // Fifo: paced by the display; or the host paces it
     surface.Configure(&config);
   }
 };
@@ -382,5 +383,19 @@ void pn_window_audio(pn_window* w, const int16_t* samples, uint32_t frames) {
 }
 
 void pn_window_title(pn_window* w, const char* title) { SDL_SetWindowTitle(w->window, title); }
+
+void pn_window_set_vsync(pn_window* w, int on) {
+  w->mode = wgpu::PresentMode::Fifo;
+  wgpu::SurfaceCapabilities capabilities;
+  if (!on && w->surface.GetCapabilities(w->engine->gpu.adapter, &capabilities)) {
+    // without waiting for the display: Mailbox (no tearing) when there is one
+    for (size_t i = 0; i < capabilities.presentModeCount; ++i)
+      if (capabilities.presentModes[i] == wgpu::PresentMode::Mailbox) w->mode = wgpu::PresentMode::Mailbox;
+    if (w->mode == wgpu::PresentMode::Fifo)
+      for (size_t i = 0; i < capabilities.presentModeCount; ++i)
+        if (capabilities.presentModes[i] == wgpu::PresentMode::Immediate) w->mode = wgpu::PresentMode::Immediate;
+  }
+  w->configure();
+}
 
 } // extern "C"

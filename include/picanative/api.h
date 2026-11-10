@@ -109,6 +109,9 @@ PN_API int pn_window_poll(pn_window* window, pn_input* input);
 /* plays stereo samples at the DSP's 32728 Hz, interleaved left, right */
 PN_API void pn_window_audio(pn_window* window, const int16_t* samples, uint32_t frames);
 PN_API void pn_window_title(pn_window* window, const char* title);
+/* 1 (the default): presenting waits for the display; 0: it does not, for a
+   host that paces its frames itself */
+PN_API void pn_window_set_vsync(pn_window* window, int on);
 /* the inputs the last pn_window_poll read, for code that reads them on its
    own (a game's platform layer finding this export at run time); 0 before
    any window polled */
