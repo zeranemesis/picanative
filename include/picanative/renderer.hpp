@@ -5,6 +5,7 @@
 #include "picanative/memory.hpp"
 #include "picanative/pica.hpp"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -101,6 +102,7 @@ private:
   void store(Surface& surface, const std::vector<uint8_t>& data);
   wgpu::TextureView texture(const pica::State& state, int unit, uint32_t uniforms[4], float border[4], float lod[4]);
   wgpu::Sampler sampler(uint32_t config);
+  wgpu::BindGroup texture_group(const wgpu::TextureView views[3], const wgpu::Sampler samplers[3]);
   wgpu::RenderPipeline pipeline(const draw::Config& config, const pica::ShaderUnit& vs);
   uint32_t arena_copy(uint32_t address, uint32_t size);
   uint32_t lookup_tables(const pica::State& state);
@@ -114,7 +116,8 @@ private:
   pica::CommandProcessor processor_;
   Stats stats_;
 
-  wgpu::BindGroupLayout layout_;
+  wgpu::BindGroupLayout layout_, texture_layout_;
+  std::map<std::array<void*, 6>, wgpu::BindGroup> texture_groups_;
   wgpu::PipelineLayout pipeline_layout_;
   wgpu::RenderPipeline depth_upload_;
   wgpu::BindGroupLayout depth_upload_layout_;

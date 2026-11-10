@@ -49,6 +49,9 @@ struct ShaderUnit {
   uint32_t entry_point = 0;
   // upload cursors
   uint32_t program_cursor = 0, descriptor_cursor = 0;
+  // shadergen::program_key, kept until the code, descriptors or entry point change
+  mutable uint64_t key = 0;
+  mutable bool key_stale = true;
   uint32_t uniform_index = 0, uniform_component = 0;
   bool uniform_wide = false;
   std::array<uint32_t, 4> uniform_staging{};

@@ -134,7 +134,9 @@ void CommandProcessor::configure(ShaderUnit& unit, uint32_t offset, uint32_t val
   } else if (offset >= kShaderIntUniforms && offset <= kShaderIntUniformsEnd) {
     std::memcpy(unit.int_uniforms[offset - kShaderIntUniforms].data(), &value, 4);
   } else if (offset == kShaderEntryPoint) {
-    unit.entry_point = value & (kProgramSize - 1);
+    const uint32_t entry = value & (kProgramSize - 1);
+    unit.key_stale |= unit.entry_point != entry;
+    unit.entry_point = entry;
   } else if (offset == kShaderUniformIndex) {
     unit.uniform_index = value & 0x7F;
     unit.uniform_component = 0;
@@ -144,11 +146,17 @@ void CommandProcessor::configure(ShaderUnit& unit, uint32_t offset, uint32_t val
   } else if (offset == kShaderProgramIndex) {
     unit.program_cursor = value & (kProgramSize - 1);
   } else if (offset >= kShaderProgramData && offset <= kShaderProgramDataEnd) {
-    if (unit.program_cursor < kProgramSize) unit.program[unit.program_cursor++] = value;
+    if (unit.program_cursor < kProgramSize) {
+      unit.key_stale |= unit.program[unit.program_cursor] != value;
+      unit.program[unit.program_cursor++] = value;
+    }
   } else if (offset == kShaderDescriptorIndex) {
     unit.descriptor_cursor = value & (kDescriptorSize - 1);
   } else if (offset >= kShaderDescriptorData && offset <= kShaderDescriptorDataEnd) {
-    if (unit.descriptor_cursor < kDescriptorSize) unit.descriptors[unit.descriptor_cursor++] = value;
+    if (unit.descriptor_cursor < kDescriptorSize) {
+      unit.key_stale |= unit.descriptors[unit.descriptor_cursor] != value;
+      unit.descriptors[unit.descriptor_cursor++] = value;
+    }
   }
 }
 

@@ -27,6 +27,7 @@ struct Timed {
   ~Timed() { total += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(); }
 };
 
+
 uint32_t align_up(uint32_t value, uint32_t to) { return (value + to - 1) / to * to; }
 
 float f24(uint32_t raw) { return pica::decode_float24(raw); }
@@ -145,7 +146,7 @@ constexpr const char* kDepthUploadWgsl = R"(
 
 // DisplayTransfer on the GPU: each invocation makes a word of the output,
 // byte for byte as transfer.cpp encodes it (little endian, linear lines).
-// p: output width, height, format | flip << 8, words.
+// p: output width, height, format | flip << 8 | first input line << 16, words.
 const char* kTransferWgsl = R"(
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<u32>;
@@ -164,7 +165,8 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
   let i = id.y * 65535u * 64u + id.x;
   if (i >= p.w) { return; }
   let format = p.z & 0xFFu;
-  let flip = (p.z >> 8u) != 0u;
+  let flip = ((p.z >> 8u) & 1u) != 0u;
+  let first = p.z >> 16u;
   let bpp = select(2u, select(3u, 4u, format == 0u), format <= 1u);
   var word = 0u;
   for (var b = 0u; b < 4u; b++) {
@@ -172,7 +174,7 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
     let pixel = at / bpp;
     if (pixel >= p.x * p.y) { break; }
     let line = pixel / p.x;
-    let y = select(line, p.y - 1u - line, flip);
+    let y = first + select(line, p.y - 1u - line, flip);
     word |= ((encoded(pixel % p.x, y, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
   }
   output[i] = word;
@@ -214,7 +216,7 @@ Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool 
     : gpu_(gpu), memory_(memory), cached_(cache_surfaces), trusted_(trust_cpu_writes), processor_(memory) {
   processor_.on_draw = [this](const pica::State& state, bool indexed) { record(state, indexed); };
 
-  wgpu::BindGroupLayoutEntry entries[10] = {};
+  wgpu::BindGroupLayoutEntry entries[4] = {};
   for (int i = 0; i < 2; ++i) {
     entries[i].binding = i;
     entries[i].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
@@ -226,24 +228,28 @@ Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool 
     entries[i].visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment;
     entries[i].buffer.type = wgpu::BufferBindingType::ReadOnlyStorage;
   }
-  for (int i = 4; i < 7; ++i) {
-    entries[i].binding = i;
-    entries[i].visibility = wgpu::ShaderStage::Fragment;
-    entries[i].texture.sampleType = wgpu::TextureSampleType::Float;
-    entries[i].texture.viewDimension = wgpu::TextureViewDimension::e2D;
-  }
-  for (int i = 7; i < 10; ++i) {
-    entries[i].binding = i;
-    entries[i].visibility = wgpu::ShaderStage::Fragment;
-    entries[i].sampler.type = wgpu::SamplerBindingType::Filtering;
-  }
   wgpu::BindGroupLayoutDescriptor ld{};
-  ld.entryCount = 10;
+  ld.entryCount = 4;
   ld.entries = entries;
   layout_ = gpu_.device.CreateBindGroupLayout(&ld);
+  // the textures and their samplers, a group shared by the draws that use the same ones
+  wgpu::BindGroupLayoutEntry te[6] = {};
+  for (int i = 0; i < 3; ++i) {
+    te[i].binding = i;
+    te[i].visibility = wgpu::ShaderStage::Fragment;
+    te[i].texture.sampleType = wgpu::TextureSampleType::Float;
+    te[i].texture.viewDimension = wgpu::TextureViewDimension::e2D;
+    te[3 + i].binding = 3 + i;
+    te[3 + i].visibility = wgpu::ShaderStage::Fragment;
+    te[3 + i].sampler.type = wgpu::SamplerBindingType::Filtering;
+  }
+  ld.entryCount = 6;
+  ld.entries = te;
+  texture_layout_ = gpu_.device.CreateBindGroupLayout(&ld);
+  const wgpu::BindGroupLayout layouts[2] = {layout_, texture_layout_};
   wgpu::PipelineLayoutDescriptor pld{};
-  pld.bindGroupLayoutCount = 1;
-  pld.bindGroupLayouts = &layout_;
+  pld.bindGroupLayoutCount = 2;
+  pld.bindGroupLayouts = layouts;
   pipeline_layout_ = gpu_.device.CreatePipelineLayout(&pld);
 
   // a unit that is on but points at nothing samples transparent black
@@ -432,12 +438,15 @@ uint32_t Renderer::arena_copy(uint32_t address, uint32_t size) {
 }
 
 uint32_t Renderer::lookup_tables(const pica::State& state) {
-  std::vector<uint32_t> lights(24 * 256), fog(128);
-  for (int t = 0; t < 24; ++t) std::memcpy(&lights[t * 256], state.light_tables[t].data(), 256 * 4);
-  std::memcpy(fog.data(), state.fog_table.data(), 128 * 4);
-  if (last_luts_at_ != UINT32_MAX && lights == last_light_tables_ && fog == last_fog_table_) return last_luts_at_;
-  last_light_tables_ = lights;
-  last_fog_table_ = fog;
+  // the same tables as the last draw's (the usual case): already uploaded
+  const uint32_t* lights_now = state.light_tables[0].data(); // 24 tables of 256, one after the other
+  if (last_luts_at_ != UINT32_MAX && std::memcmp(last_light_tables_.data(), lights_now, 24 * 256 * 4) == 0 &&
+      std::memcmp(last_fog_table_.data(), state.fog_table.data(), 128 * 4) == 0)
+    return last_luts_at_;
+  last_light_tables_.assign(lights_now, lights_now + 24 * 256);
+  last_fog_table_.assign(state.fog_table.begin(), state.fog_table.end());
+  const std::vector<uint32_t>& lights = last_light_tables_;
+  const std::vector<uint32_t>& fog = last_fog_table_;
   const uint32_t at = static_cast<uint32_t>(luts_.size() / 2);
   for (uint32_t w : lights) {
     const float step = static_cast<float>(w >> 12 & 0x7FF) / 2047.0f;
@@ -450,6 +459,31 @@ uint32_t Renderer::lookup_tables(const pica::State& state) {
   }
   last_luts_at_ = at;
   return at;
+}
+
+// The textures' group of a draw, made once for each set of textures and
+// samplers. It holds them, so their handles stay unique while it is cached.
+wgpu::BindGroup Renderer::texture_group(const wgpu::TextureView views[3], const wgpu::Sampler samplers[3]) {
+  std::array<void*, 6> key;
+  for (int u = 0; u < 3; ++u) key[u] = views[u].Get(), key[3 + u] = samplers[u].Get();
+  auto& slot = texture_groups_[key];
+  if (slot) return slot;
+  // shortcut: a game cycling through more sets than this rebuilds them; an LRU if one does
+  if (texture_groups_.size() > 8192) {
+    texture_groups_.clear();
+    return texture_group(views, samplers);
+  }
+  wgpu::BindGroupEntry e[6] = {};
+  for (int u = 0; u < 3; ++u) {
+    e[u].binding = u, e[u].textureView = views[u];
+    e[3 + u].binding = 3 + u, e[3 + u].sampler = samplers[u];
+  }
+  wgpu::BindGroupDescriptor bd{};
+  bd.layout = texture_layout_;
+  bd.entryCount = 6;
+  bd.entries = e;
+  slot = gpu_.device.CreateBindGroup(&bd);
+  return slot;
 }
 
 // The sampler a texture unit's configuration register describes: its wraps
@@ -664,6 +698,7 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
   return result;
 }
 
+
 void Renderer::record(const pica::State& state, bool indexed) {
   ++stats_.draws;
   Timed timed{stats_.record};
@@ -852,6 +887,22 @@ void Renderer::submit(const std::vector<Surface*>& back) {
     ++stats_.passes;
   };
 
+  // the buffers' group, the same for every draw of this submit (dynamic
+  // offsets), made at the first draw (a submit of clears has no uniforms)
+  wgpu::BindGroup buffers;
+  auto make_buffers = [&] {
+    wgpu::BindGroupEntry e[4] = {};
+    e[0].binding = 0, e[0].buffer = uniforms, e[0].size = kVsUniformsSize;
+    e[1].binding = 1, e[1].buffer = uniforms, e[1].size = sizeof(draw::DrawUniforms);
+    e[2].binding = 2, e[2].buffer = arena, e[2].size = align_up(static_cast<uint32_t>(std::max<size_t>(arena_.size(), 16)), 16);
+    e[3].binding = 3, e[3].buffer = luts, e[3].size = align_up(static_cast<uint32_t>(std::max<size_t>(luts_.size() * 4, 16)), 16);
+    wgpu::BindGroupDescriptor bd{};
+    bd.layout = layout_;
+    bd.entryCount = 4;
+    bd.entries = e;
+    buffers = gpu_.device.CreateBindGroup(&bd);
+  };
+
   for (const PendingDraw& d : pending_) {
     if (d.clear) {
       // a fill over the whole surface, done on the GPU
@@ -900,20 +951,11 @@ void Renderer::submit(const std::vector<Surface*>& back) {
       continue;
     }
     if (!pass || pass_depth_only || pass_color != d.color || pass_depth != d.depth) begin_pass(d.color, d.depth);
-    wgpu::BindGroupEntry e[10] = {};
-    e[0].binding = 0, e[0].buffer = uniforms, e[0].size = kVsUniformsSize;
-    e[1].binding = 1, e[1].buffer = uniforms, e[1].size = sizeof(draw::DrawUniforms);
-    e[2].binding = 2, e[2].buffer = arena, e[2].size = align_up(static_cast<uint32_t>(std::max<size_t>(arena_.size(), 16)), 16);
-    e[3].binding = 3, e[3].buffer = luts, e[3].size = align_up(static_cast<uint32_t>(std::max<size_t>(luts_.size() * 4, 16)), 16);
-    for (int u = 0; u < 3; ++u) e[4 + u].binding = 4 + u, e[4 + u].textureView = d.views[u];
-    for (int u = 0; u < 3; ++u) e[7 + u].binding = 7 + u, e[7 + u].sampler = d.samplers[u];
-    wgpu::BindGroupDescriptor bd{};
-    bd.layout = layout_;
-    bd.entryCount = 10;
-    bd.entries = e;
     const uint32_t offsets[2] = {d.vs_offset, d.draw_offset};
     pass.SetPipeline(d.pipeline);
-    pass.SetBindGroup(0, gpu_.device.CreateBindGroup(&bd), 2, offsets);
+    if (!buffers) make_buffers();
+    pass.SetBindGroup(0, buffers, 2, offsets);
+    pass.SetBindGroup(1, texture_group(d.views, d.samplers));
     pass.SetScissorRect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
     pass.SetStencilReference(d.stencil_reference);
     const wgpu::Color constant{d.blend_constant[0], d.blend_constant[1], d.blend_constant[2], d.blend_constant[3]};
@@ -1100,9 +1142,22 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
     return false;
   // as wide: a crop only drops lines, and never moves the output (transfer.cpp)
   if (out_width != width || out_height > height || out_width == 0 || out_height == 0) return false;
-  const auto found = surfaces_.find({input, width, height, false});
-  if (found == surfaces_.end() || !found->second->loaded) return false;
-  Surface& s = *found->second;
+  // a color surface as wide holding the lines read: from its start, or from a
+  // line of tiles down (a game drawing both screens into one buffer)
+  Surface* found = nullptr;
+  uint32_t first = 0;
+  for (auto& [key, candidate] : surfaces_) {
+    const uint32_t tile_line = width * 8 * 4;
+    if (candidate->depth || candidate->width != width || !candidate->loaded || input < candidate->address ||
+        (input - candidate->address) % tile_line != 0)
+      continue;
+    const uint32_t line = (input - candidate->address) / tile_line * 8;
+    if (line + out_height > candidate->height) continue;
+    found = candidate.get(), first = line;
+    break;
+  }
+  if (!found) return false;
+  Surface& s = *found;
 
   const ColorFormat format = transfer_format(flags >> 12);
   const uint32_t bpp = bytes_per_pixel(format), bytes = out_width * out_height * bpp;
@@ -1115,7 +1170,7 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   const wgpu::Buffer out = gpu_.device.CreateBuffer(&bd);
   bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
   const wgpu::Buffer back = gpu_.device.CreateBuffer(&bd);
-  const uint32_t parameters[4] = {out_width, out_height, static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8, words};
+  const uint32_t parameters[4] = {out_width, out_height, static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8 | first << 16, words};
   const wgpu::Buffer uniform = make_buffer(gpu_, parameters, sizeof parameters, wgpu::BufferUsage::Uniform);
   const wgpu::TextureView view = s.texture.CreateView();
   wgpu::BindGroupEntry e[3] = {};

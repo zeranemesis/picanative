@@ -559,12 +559,12 @@ std::string fragment_wgsl(const Config& c) {
   std::ostringstream w;
   w << kDrawStruct;
   w << "@group(0) @binding(3) var<storage, read> lut_data: array<vec2f>;\n"
-       "@group(0) @binding(4) var tex0: texture_2d<f32>;\n"
-       "@group(0) @binding(5) var tex1: texture_2d<f32>;\n"
-       "@group(0) @binding(6) var tex2: texture_2d<f32>;\n"
-       "@group(0) @binding(7) var smp0: sampler;\n"
-       "@group(0) @binding(8) var smp1: sampler;\n"
-       "@group(0) @binding(9) var smp2: sampler;\n";
+       "@group(1) @binding(0) var tex0: texture_2d<f32>;\n"
+       "@group(1) @binding(1) var tex1: texture_2d<f32>;\n"
+       "@group(1) @binding(2) var tex2: texture_2d<f32>;\n"
+       "@group(1) @binding(3) var smp0: sampler;\n"
+       "@group(1) @binding(4) var smp1: sampler;\n"
+       "@group(1) @binding(5) var smp2: sampler;\n";
   w << kVOut;
   // fragment stage
   w << "fn border(mode: u32) -> bool { return mode == 1u || mode == 5u; }\n"

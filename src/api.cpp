@@ -51,6 +51,12 @@ void pn_texture_copy(pn_engine* e, uint32_t input, uint32_t output, uint32_t siz
 void pn_sync_for_cpu(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->sync(address, size); }
 void pn_cpu_wrote(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->before_cpu_write(address, size); }
 
+void pn_times(pn_engine* e, double out[7]) {
+  const auto& s = e->renderer->stats();
+  const double times[7] = {s.record, s.textures, s.pipelines_time, s.encode, s.wait, s.store, s.load};
+  for (int i = 0; i < 7; ++i) out[i] = times[i];
+}
+
 void pn_stats(pn_engine* e, uint64_t out[3]) {
   const auto& s = e->renderer->stats();
   out[0] = s.draws;

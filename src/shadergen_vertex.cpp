@@ -350,6 +350,7 @@ std::string state_machine(const pica::ShaderUnit& unit, const std::string& unifo
 } // namespace
 
 uint64_t program_key(const pica::ShaderUnit& unit) {
+  if (!unit.key_stale) return unit.key;
   uint64_t hash = 0xCBF29CE484222325ull;
   auto add = [&hash](uint32_t word) {
     for (int b = 0; b < 4; ++b) hash = (hash ^ (word >> (8 * b) & 0xFF)) * 0x100000001B3ull;
@@ -357,6 +358,7 @@ uint64_t program_key(const pica::ShaderUnit& unit) {
   for (uint32_t word : unit.program) add(word);
   for (uint32_t word : unit.descriptors) add(word);
   add(unit.entry_point);
+  unit.key = hash, unit.key_stale = false;
   return hash;
 }
 

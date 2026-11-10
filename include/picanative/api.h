@@ -58,6 +58,10 @@ PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* 
 
 /* counters, for a status line: draws, pipelines, shader errors */
 PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);
+/* where the engine's time went, in seconds: recording draws (of which
+   textures, then pipelines), encoding, waiting for the GPU (of which storing
+   to memory), loading from memory */
+PN_API void pn_times(pn_engine* engine, double out[7]);
 
 /* The port's window (built with SDL3): both screens drawn by the engine's
    device, the player's inputs, the console's sound. */
