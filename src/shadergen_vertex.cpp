@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -177,6 +178,130 @@ std::string arithmetic(uint32_t word, const std::array<uint32_t, pica::kDescript
   return "{ let t = " + value + "; " + write_masked(word >> 21 & 0x1F, d) + "}";
 }
 
+// The structured translation: conditions become if/else, calls are inlined,
+// loops become for loops. A forward jump sets its block's jump variable to
+// where it lands, and the code after it runs in segments guarded by
+// `j <= segment start`, so a jump may skip over other jumps' landing points.
+// DXC compiles this far faster than the state machine. It gives up (and the
+// state machine is used) on flow it cannot nest: backward jumps, jumps or
+// blocks running past their block's end, a break outside a loop, call chains
+// too deep or too long.
+struct Structured {
+  const pica::ShaderUnit& unit;
+  std::ostringstream out;
+  int emitted = 0, jumps = 0;
+
+  bool emit(uint32_t from, uint32_t to, int depth, int loops) {
+    constexpr uint32_t size = pica::kProgramSize;
+    if (depth > 16) return false;
+    std::string j; // this block's jump variable, once it has a jump
+    std::set<uint32_t> lands;
+    bool guarded = false;
+    for (uint32_t pc = from; pc < to;) {
+      if (!j.empty() && (!guarded || lands.count(pc))) {
+        if (guarded) out << "}\n";
+        out << "if (" << j << " <= " << pc << "u) {\n";
+        guarded = true;
+      }
+      if (pc >= size) {
+        out << "return o;\n";
+        break;
+      }
+      if (++emitted > 8192) return false;
+      const uint32_t word = unit.program[pc], op = opcode(word);
+      if (!flow(op)) {
+        const std::string code = arithmetic(word, unit.descriptors);
+        if (!code.empty()) out << code << "\n";
+        ++pc;
+        continue;
+      }
+      const uint32_t dest = target(word), n = count(word);
+      if (op == End) {
+        out << "return o;\n";
+        break;
+      }
+      switch (op) {
+      case Call: case CallC: case CallU: {
+        const std::string cond = op == Call ? "true" : op == CallU ? bool_set(word) : condition(word);
+        out << "if (" << cond << ") {\n";
+        if (!emit(dest, dest + n, depth + 1, loops)) return false;
+        out << "}\n";
+        ++pc;
+        break;
+      }
+      case IfC: case IfU: {
+        const uint32_t then_end = pc + 1 + (dest - std::min(pc + 1, dest)), after = dest + n;
+        if (after <= pc || after > to) return false;
+        for (uint32_t land : lands)
+          if (land > pc && land < after) return false; // a jump lands inside
+        out << "if (" << (op == IfU ? bool_set(word) : condition(word)) << ") {\n";
+        if (!emit(pc + 1, then_end, depth + 1, loops)) return false;
+        out << "} else {\n";
+        if (!emit(dest, after, depth + 1, loops)) return false;
+        out << "}\n";
+        pc = after;
+        break;
+      }
+      case Loop: {
+        if (dest < pc || dest + 1 > to) return false;
+        for (uint32_t land : lands)
+          if (land > pc && land <= dest) return false;
+        const std::string i = "U.ints[" + std::to_string(word >> 22 & 3) + "]", k = "k" + std::to_string(depth);
+        out << "a.z = i32((" << i << " >> 8u) & 0xFFu);\nfor (var " << k << " = 0u; " << k << " <= (" << i
+            << " & 0xFFu); " << k << "++) {\n";
+        if (!emit(pc + 1, dest + 1, depth + 1, loops + 1)) return false;
+        out << "a.z += (i32(" << i << " << 8u) >> 24);\n}\n";
+        pc = dest + 1;
+        break;
+      }
+      case Break: case BreakC:
+        if (loops == 0) return false;
+        out << "if (" << (op == Break ? "true" : condition(word)) << ") { break; }\n";
+        ++pc;
+        break;
+      case JmpC: case JmpU: {
+        if (dest <= pc || dest > to) return false;
+        if (j.empty()) { // the first jump of the block is never guarded: declare here
+          j = "j" + std::to_string(++jumps);
+          out << "var " << j << " = 0u;\n";
+        }
+        // jmpu tests either value of its bool: bit 0 of the count inverts it
+        const std::string cond = op == JmpC ? condition(word)
+                                            : "((" + bool_set(word) + ") == " + (n & 1 ? "false" : "true") + ")";
+        out << "if (" << cond << ") { " << j << " = " << dest << "u; }\n";
+        if (guarded) out << "}\n";
+        guarded = false;
+        lands.insert(dest);
+        ++pc;
+        break;
+      }
+      }
+    }
+    if (guarded) out << "}\n";
+    return true;
+  }
+};
+
+const char* kHelpers =
+    "fn pmul(a: vec4f, b: vec4f) -> vec4f { let p = a * b; return select(p, vec4f(0.0), (p != p) & (a == a) & (b == b)); }\n"
+    "fn pmul1(a: f32, b: f32) -> f32 { let p = a * b; return select(p, 0.0, (p != p) & (a == a) & (b == b)); }\n"
+    "fn pdot3(a: vec4f, b: vec4f) -> f32 { let p = pmul(a, b); return (p.x + p.y) + p.z; }\n"
+    "fn pdot4(a: vec4f, b: vec4f) -> f32 { let p = pmul(a, b); return ((p.x + p.y) + p.z) + p.w; }\n"
+    "fn pmax(a: vec4f, b: vec4f) -> vec4f { return select(b, a, a > b); }\n"
+    "fn pmin(a: vec4f, b: vec4f) -> vec4f { return select(b, a, a < b); }\n"
+    "fn pmax1(a: f32, b: f32) -> f32 { return select(b, a, a > b); }\n";
+
+// the flow instructions name the uniforms U.ints and U.bools
+std::string name_uniforms(std::string out, const std::string& uniforms) {
+  for (size_t at = 0; (at = out.find("U.", at)) != std::string::npos; at += uniforms.size() + 1)
+    if (at == 0 || !(std::isalnum(static_cast<unsigned char>(out[at - 1])) || out[at - 1] == '_'))
+      out.replace(at, 1, uniforms);
+  return out;
+}
+
+// the exact translation, for any flow
+std::string state_machine(const pica::ShaderUnit& unit, const std::string& uniforms, std::ostringstream& w);
+
 } // namespace
 
 uint64_t program_key(const pica::ShaderUnit& unit) {
@@ -191,6 +316,25 @@ uint64_t program_key(const pica::ShaderUnit& unit) {
 }
 
 std::string vertex_function(const pica::ShaderUnit& unit, const std::string& uniforms) {
+  std::ostringstream w;
+  w << "fn cu(i: i32) -> vec4f { if (i < 0 || i >= 96) { return vec4f(0.0); } return " << uniforms
+    << ".c[i]; }\n" << kHelpers;
+  w << "fn pica_vs(vin: array<vec4f, 16>) -> array<vec4f, 16> {\n";
+  w << "  var v = vin;\n  var o: array<vec4f, 16>;\n  var r: array<vec4f, 16>;\n";
+  w << "  for (var k = 0; k < 16; k++) { r[k] = vec4f(0.0, 0.0, 0.0, 1.0); }\n";
+  w << "  var a = vec3<i32>(0);\n  var cc = vec2<bool>(false, false);\n";
+  if (!std::getenv("PN_VS_STATE_MACHINE")) { // the state machine alone, to check one against the other
+    Structured s{unit};
+    if (s.emit(unit.entry_point, pica::kProgramSize, 0, 0)) {
+      w << s.out.str() << "  return o;\n}\n";
+      return name_uniforms(w.str(), uniforms);
+    }
+  }
+  return state_machine(unit, uniforms, w);
+}
+
+namespace {
+std::string state_machine(const pica::ShaderUnit& unit, const std::string& uniforms, std::ostringstream& w) {
   const auto& program = unit.program;
   constexpr uint32_t size = pica::kProgramSize;
 
@@ -237,21 +381,6 @@ std::string vertex_function(const pica::ShaderUnit& unit, const std::string& uni
     }
   }
 
-  std::ostringstream w;
-  w << "fn cu(i: i32) -> vec4f { if (i < 0 || i >= 96) { return vec4f(0.0); } return " << uniforms
-    << ".c[i]; }\n";
-  w << "fn pmul(a: vec4f, b: vec4f) -> vec4f { let p = a * b; return select(p, vec4f(0.0), (p != p) & (a == a) & (b == b)); }\n";
-  w << "fn pmul1(a: f32, b: f32) -> f32 { let p = a * b; return select(p, 0.0, (p != p) & (a == a) & (b == b)); }\n";
-  w << "fn pdot3(a: vec4f, b: vec4f) -> f32 { let p = pmul(a, b); return (p.x + p.y) + p.z; }\n";
-  w << "fn pdot4(a: vec4f, b: vec4f) -> f32 { let p = pmul(a, b); return ((p.x + p.y) + p.z) + p.w; }\n";
-  w << "fn pmax(a: vec4f, b: vec4f) -> vec4f { return select(b, a, a > b); }\n";
-  w << "fn pmin(a: vec4f, b: vec4f) -> vec4f { return select(b, a, a < b); }\n";
-  w << "fn pmax1(a: f32, b: f32) -> f32 { return select(b, a, a > b); }\n";
-  w << "fn pica_vs(vin: array<vec4f, 16>) -> array<vec4f, 16> {\n";
-  w << "  let U = " << uniforms << ";\n";
-  w << "  var v = vin;\n  var o: array<vec4f, 16>;\n  var r: array<vec4f, 16>;\n";
-  w << "  for (var k = 0; k < 16; k++) { r[k] = vec4f(0.0, 0.0, 0.0, 1.0); }\n";
-  w << "  var a = vec3<i32>(0);\n  var cc = vec2<bool>(false, false);\n";
   // the block stack: end, return address, repeats left, increment, start, is a loop
   w << "  var be: array<u32, 32>; var br: array<u32, 32>; var bn: array<u32, 32>; var bi: array<i32, 32>;\n";
   w << "  var bs: array<u32, 32>; var bl: array<bool, 32>; var sp = 0;\n";
@@ -339,12 +468,8 @@ std::string vertex_function(const pica::ShaderUnit& unit, const std::string& uni
   }
   w << "      default: { done = true; }\n";
   w << "    }\n    if (done) { break; }\n  }\n  return o;\n}\n";
-  // the flow instructions name the uniforms U.ints and U.bools
-  std::string out = w.str();
-  for (size_t at = 0; (at = out.find("U.", at)) != std::string::npos; at += uniforms.size() + 1)
-    if (at == 0 || !(std::isalnum(static_cast<unsigned char>(out[at - 1])) || out[at - 1] == '_'))
-      out.replace(at, 1, uniforms);
-  return out;
+  return name_uniforms(w.str(), uniforms);
 }
+} // namespace
 
 } // namespace picanative::shadergen
