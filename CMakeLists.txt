@@ -24,7 +24,18 @@ endif ()
 
 # GPU layer: Dawn (WebGPU), found as Aurora ships it (a prebuilt install tree,
 # https://github.com/encounter/dawn-build), through CMAKE_PREFIX_PATH or Dawn_DIR.
-find_package(Dawn CONFIG REQUIRED)
+if (ANDROID)
+  # Dawn as Aurora ships it for Android: a static library (its CMake config
+  # names a liblog path on the machine that built it, so the target is ours)
+  set(PICANATIVE_DAWN_ANDROID "" CACHE PATH "Dawn prebuilt for Android (include/, lib/libwebgpu_dawn.a)")
+  add_library(dawn::webgpu_dawn STATIC IMPORTED)
+  set_target_properties(dawn::webgpu_dawn PROPERTIES
+    IMPORTED_LOCATION "${PICANATIVE_DAWN_ANDROID}/lib/libwebgpu_dawn.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${PICANATIVE_DAWN_ANDROID}/include"
+    INTERFACE_LINK_LIBRARIES "log;android;dl")
+else ()
+  find_package(Dawn CONFIG REQUIRED)
+endif ()
 add_library(picanative_gpu STATIC src/gpu.cpp src/draw.cpp src/renderer.cpp)
 target_include_directories(picanative_gpu PUBLIC include)
 target_link_libraries(picanative_gpu PUBLIC picanative dawn::webgpu_dawn)
@@ -37,7 +48,16 @@ set_target_properties(picanative_api PROPERTIES OUTPUT_NAME picanative_engine)
 
 # the window (src/window.cpp), with SDL3 as Aurora ships it: through
 # CMAKE_PREFIX_PATH or SDL3_DIR
-find_package(SDL3 CONFIG)
+set(PICANATIVE_SDL3_SOURCE "" CACHE PATH "SDL3's sources, to build it with the engine (Android)")
+if (PICANATIVE_SDL3_SOURCE)
+  set(SDL_SHARED ON CACHE BOOL "" FORCE)
+  set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+  set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${PICANATIVE_SDL3_SOURCE}" SDL3 EXCLUDE_FROM_ALL)
+  set(SDL3_FOUND TRUE)
+else ()
+  find_package(SDL3 CONFIG)
+endif ()
 if (SDL3_FOUND)
   target_sources(picanative_api PRIVATE src/window.cpp)
   target_link_libraries(picanative_api PRIVATE SDL3::SDL3)

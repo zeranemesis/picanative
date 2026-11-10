@@ -4,3 +4,4 @@ out/
 *.pntrace
 traces/
 build/
+build-*/
