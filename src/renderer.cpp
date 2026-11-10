@@ -1093,10 +1093,11 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   // a linear picture of the same size or cropped; the rest is transfer.cpp's
   const uint32_t width = input_dimensions & 0xFFFF, height = input_dimensions >> 16;
   const uint32_t out_width = output_dimensions & 0xFFFF, out_height = output_dimensions >> 16;
-  const bool flip = flags & 1, input_linear = flags & 2, crop = flags & 4;
+  const bool flip = flags & 1, input_linear = flags & 2;
   const bool output_tiled = input_linear != ((flags & 0x20) != 0);
   if (input_linear || output_tiled || (flags >> 24 & 3) != 0 || transfer_format(flags >> 8) != ColorFormat::RGBA8)
     return false;
+  // as wide: a crop only drops lines, and never moves the output (transfer.cpp)
   if (out_width != width || out_height > height || out_width == 0 || out_height == 0) return false;
   const auto found = surfaces_.find({input, width, height, false});
   if (found == surfaces_.end() || !found->second->loaded) return false;
@@ -1104,7 +1105,6 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
 
   const ColorFormat format = transfer_format(flags >> 12);
   const uint32_t bpp = bytes_per_pixel(format), bytes = out_width * out_height * bpp;
-  (void)crop; // the input is exactly as wide: a crop moves nothing
   const uint32_t words = (bytes + 3) / 4;
 
   submit({}); // the draws into the surface first
@@ -1137,8 +1137,6 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   gpu_.queue.Submit(1, &commands);
   ++stats_.gpu_transfers;
 
-  // flipped and cropped, the console starts the output later (transfer.cpp)
-  if (flip && crop && width > out_width) output += (width - out_width) * (out_height - 1) * bpp;
   // write_back(output) delivered what overlapped: deliveries never overlap
   deliveries_.push_back({output, bytes, back,
                          back.MapAsync(wgpu::MapMode::Read, 0, bd.size, wgpu::CallbackMode::WaitAnyOnly,
