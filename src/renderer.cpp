@@ -143,6 +143,42 @@ constexpr const char* kDepthUploadWgsl = R"(
 }
 )";
 
+// DisplayTransfer on the GPU: each invocation makes a word of the output,
+// byte for byte as transfer.cpp encodes it (little endian, linear lines).
+// p: output width, height, format | flip << 8, words.
+const char* kTransferWgsl = R"(
+@group(0) @binding(0) var source: texture_2d<f32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+@group(0) @binding(2) var<uniform> p: vec4u;
+fn encoded(x: u32, y: u32, format: u32) -> u32 {
+  let c = vec4u(round(textureLoad(source, vec2u(x, y), 0) * 255.0));
+  switch format {
+    case 0u: { return c.a | (c.b << 8u) | (c.g << 16u) | (c.r << 24u); }
+    case 1u: { return c.b | (c.g << 8u) | (c.r << 16u); }
+    case 2u: { return ((c.r >> 3u) << 11u) | ((c.g >> 2u) << 5u) | (c.b >> 3u); }
+    case 3u: { return ((c.r >> 3u) << 11u) | ((c.g >> 3u) << 6u) | ((c.b >> 3u) << 1u) | select(0u, 1u, c.a >= 128u); }
+    default: { return ((c.r >> 4u) << 12u) | ((c.g >> 4u) << 8u) | ((c.b >> 4u) << 4u) | (c.a >> 4u); }
+  }
+}
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.y * 65535u * 64u + id.x;
+  if (i >= p.w) { return; }
+  let format = p.z & 0xFFu;
+  let flip = (p.z >> 8u) != 0u;
+  let bpp = select(2u, select(3u, 4u, format == 0u), format <= 1u);
+  var word = 0u;
+  for (var b = 0u; b < 4u; b++) {
+    let at = i * 4u + b;
+    let pixel = at / bpp;
+    if (pixel >= p.x * p.y) { break; }
+    let line = pixel / p.x;
+    let y = select(line, p.y - 1u - line, flip);
+    word |= ((encoded(pixel % p.x, y, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
+  }
+  output[i] = word;
+}
+)";
+
 } // namespace
 
 struct Renderer::Surface {
@@ -254,9 +290,14 @@ Renderer::Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces, bool 
   ds.depthCompare = wgpu::CompareFunction::Always;
   pd.depthStencil = &ds;
   depth_upload_ = gpu_.device.CreateRenderPipeline(&pd);
+
+  wgpu::ComputePipelineDescriptor cd{};
+  cd.compute.module = module(gpu_, kTransferWgsl);
+  cd.compute.entryPoint = "main";
+  transfer_pipeline_ = gpu_.device.CreateComputePipeline(&cd);
 }
 
-Renderer::~Renderer() = default;
+Renderer::~Renderer() { deliver(); }
 
 void Renderer::command_list(uint32_t address, uint32_t size) {
   // pipelines finished compiling since
@@ -288,6 +329,7 @@ Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t 
     td.size = {width, height, 1};
     td.format = depth ? wgpu::TextureFormat::Depth32FloatStencil8 : wgpu::TextureFormat::RGBA8Unorm;
     td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
+    if (!depth) td.usage |= wgpu::TextureUsage::TextureBinding; // read by the GPU transfers
     slot->texture = gpu_.device.CreateTexture(&td);
   }
   return *slot;
@@ -296,6 +338,7 @@ Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t 
 // what memory holds in a surface, before this command list draws into it
 void Renderer::load(Surface& s) {
   if (s.loaded) return;
+  deliver(s.address, s.width * s.height * 4);
   Timed timed{stats_.load};
   s.loaded = true;
   const uint32_t bpp = 4;
@@ -940,6 +983,7 @@ void Renderer::submit(const std::vector<Surface*>& back) {
 }
 
 void Renderer::write_back(uint32_t address, uint32_t size, bool forget) {
+  deliver(address, size);
   std::vector<Surface*> back;
   for (auto& [key, s] : surfaces_) {
     const uint32_t bytes = s->width * s->height * 4;
@@ -985,6 +1029,7 @@ uint32_t copy_span(uint32_t size, uint32_t gap) {
 
 void Renderer::memory_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t width) {
   if (end <= start) return;
+  deliver(start, end - start);
   if (cached_ && width == 4) {
     // a whole surface: cleared on the GPU, memory gets it if anything reads it
     for (auto& [key, s] : surfaces_) {
@@ -1016,11 +1061,111 @@ void Renderer::display_transfer(uint32_t input, uint32_t output, uint32_t input_
   uint32_t input_bytes, output_bytes;
   transfer_ranges(input_dimensions, output_dimensions, flags, input_bytes, output_bytes);
   if (cached_) {
-    write_back(input, input_bytes, false);
     write_back(output, output_bytes, true);
+    if (gpu_transfer(input, output, input_dimensions, output_dimensions, flags)) {
+      // PN_CHECK_TRANSFERS: each one also done by transfer.cpp, the bytes compared
+      if (std::getenv("PN_CHECK_TRANSFERS")) {
+        deliver(output, output_bytes);
+        const uint8_t* now = memory_.map(output, output_bytes);
+        if (!now) return;
+        const std::vector<uint8_t> gpu(now, now + output_bytes);
+        write_back(input, input_bytes, false);
+        picanative::display_transfer(memory_, input, output, input_dimensions, output_dimensions, flags);
+        for (uint32_t k = 0; k < output_bytes; ++k)
+          if (gpu[k] != now[k]) {
+            std::fprintf(stderr, "transfer %08x -> %08x, flags %08x: byte %u is %02x on the GPU, %02x by transfer.cpp\n",
+                         input, output, flags, k, gpu[k], now[k]);
+            break;
+          }
+      }
+      forget_textures(output, output_bytes);
+      return;
+    }
+    write_back(input, input_bytes, false);
   }
   picanative::display_transfer(memory_, input, output, input_dimensions, output_dimensions, flags);
   forget_textures(output, output_bytes);
+}
+
+bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions,
+                            uint32_t output_dimensions, uint32_t flags) {
+  // the case games use to show a frame: a color buffer the GPU holds, out to
+  // a linear picture of the same size or cropped; the rest is transfer.cpp's
+  const uint32_t width = input_dimensions & 0xFFFF, height = input_dimensions >> 16;
+  const uint32_t out_width = output_dimensions & 0xFFFF, out_height = output_dimensions >> 16;
+  const bool flip = flags & 1, input_linear = flags & 2, crop = flags & 4;
+  const bool output_tiled = input_linear != ((flags & 0x20) != 0);
+  if (input_linear || output_tiled || (flags >> 24 & 3) != 0 || transfer_format(flags >> 8) != ColorFormat::RGBA8)
+    return false;
+  if (out_width != width || out_height > height || out_width == 0 || out_height == 0) return false;
+  const auto found = surfaces_.find({input, width, height, false});
+  if (found == surfaces_.end() || !found->second->loaded) return false;
+  Surface& s = *found->second;
+
+  const ColorFormat format = transfer_format(flags >> 12);
+  const uint32_t bpp = bytes_per_pixel(format), bytes = out_width * out_height * bpp;
+  (void)crop; // the input is exactly as wide: a crop moves nothing
+  const uint32_t words = (bytes + 3) / 4;
+
+  submit({}); // the draws into the surface first
+  wgpu::BufferDescriptor bd{};
+  bd.size = uint64_t{words} * 4;
+  bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopySrc;
+  const wgpu::Buffer out = gpu_.device.CreateBuffer(&bd);
+  bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+  const wgpu::Buffer back = gpu_.device.CreateBuffer(&bd);
+  const uint32_t parameters[4] = {out_width, out_height, static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8, words};
+  const wgpu::Buffer uniform = make_buffer(gpu_, parameters, sizeof parameters, wgpu::BufferUsage::Uniform);
+  const wgpu::TextureView view = s.texture.CreateView();
+  wgpu::BindGroupEntry e[3] = {};
+  e[0].binding = 0, e[0].textureView = view;
+  e[1].binding = 1, e[1].buffer = out, e[1].size = bd.size;
+  e[2].binding = 2, e[2].buffer = uniform, e[2].size = sizeof parameters;
+  wgpu::BindGroupDescriptor group{};
+  group.layout = transfer_pipeline_.GetBindGroupLayout(0);
+  group.entryCount = 3;
+  group.entries = e;
+  const wgpu::CommandEncoder encoder = gpu_.device.CreateCommandEncoder();
+  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+  pass.SetPipeline(transfer_pipeline_);
+  pass.SetBindGroup(0, gpu_.device.CreateBindGroup(&group));
+  const uint32_t groups = (words + 63) / 64;
+  pass.DispatchWorkgroups(std::min(groups, 65535u), (groups + 65534) / 65535);
+  pass.End();
+  encoder.CopyBufferToBuffer(out, 0, back, 0, bd.size);
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  gpu_.queue.Submit(1, &commands);
+  ++stats_.gpu_transfers;
+
+  // flipped and cropped, the console starts the output later (transfer.cpp)
+  if (flip && crop && width > out_width) output += (width - out_width) * (out_height - 1) * bpp;
+  // write_back(output) delivered what overlapped: deliveries never overlap
+  deliveries_.push_back({output, bytes, back,
+                         back.MapAsync(wgpu::MapMode::Read, 0, bd.size, wgpu::CallbackMode::WaitAnyOnly,
+                                       [](wgpu::MapAsyncStatus, wgpu::StringView) {})});
+  // shortcut: a host that never reads its pictures back keeps up to 16 on the way
+  if (deliveries_.size() > 16) deliver(deliveries_.front().address, 1);
+  return true;
+}
+
+void Renderer::deliver(uint32_t address, uint32_t size) {
+  for (size_t i = 0; i < deliveries_.size();) {
+    Delivery& d = deliveries_[i];
+    if (!(address < d.address + d.size && d.address < address + size)) {
+      ++i;
+      continue;
+    }
+    Timed waited{stats_.wait};
+    gpu_.instance.WaitAny(d.mapped, UINT64_MAX);
+    if (const auto* bytes = static_cast<const uint8_t*>(d.buffer.GetConstMappedRange(0, (d.size + 3) & ~3u))) {
+      if (uint8_t* to = memory_.map(d.address, d.size)) std::memcpy(to, bytes, d.size);
+      else
+        for (uint32_t k = 0; k < d.size; ++k)
+          if (uint8_t* b = memory_.map(d.address + k, 1)) *b = bytes[k];
+    }
+    d.buffer.Unmap();
+    deliveries_.erase(deliveries_.begin() + static_cast<std::ptrdiff_t>(i));
+  }
 }
 
 void Renderer::texture_copy(uint32_t input, uint32_t output, uint32_t size, uint32_t input_gap, uint32_t output_gap) {

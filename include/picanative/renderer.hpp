@@ -55,7 +55,7 @@ public:
 
   struct Stats {
     uint64_t draws = 0, skipped = 0, passes = 0, pipelines = 0, textures_decoded = 0, flushes = 0;
-    uint64_t shader_errors = 0, vertex_modules = 0, waiting = 0; // waiting: draws skipped while their pipeline compiles
+    uint64_t shader_errors = 0, vertex_modules = 0, waiting = 0, gpu_transfers = 0; // waiting: draws skipped while their pipeline compiles
     // where the time goes, in seconds
     double record = 0, textures = 0, pipelines_time = 0, encode = 0, wait = 0, load = 0, store = 0;
   };
@@ -83,6 +83,12 @@ private:
   // over it also stop holding it (memory is about to change there)
   void write_back(uint32_t address, uint32_t size, bool forget);
   void forget_textures(uint32_t address, uint32_t size);
+  // a display transfer done on the GPU, when its input is a surface it holds
+  bool gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
+                    uint32_t flags);
+  // memory gets the GPU transfers on their way into a range (all of them with
+  // the defaults), the oldest first
+  void deliver(uint32_t address = 0, uint32_t size = UINT32_MAX);
   Surface& surface(uint32_t address, uint32_t width, uint32_t height, bool depth);
   void load(Surface& surface);
   void store(Surface& surface, const std::vector<uint8_t>& data);
@@ -106,6 +112,15 @@ private:
   wgpu::RenderPipeline depth_upload_;
   wgpu::BindGroupLayout depth_upload_layout_;
   wgpu::TextureView empty_texture_;
+  wgpu::ComputePipeline transfer_pipeline_;
+  // GPU transfers whose bytes are on their way to memory: read back when
+  // something reaches their range, so the CPU never waits for them otherwise
+  struct Delivery {
+    uint32_t address, size;
+    wgpu::Buffer buffer;
+    wgpu::Future mapped;
+  };
+  std::vector<Delivery> deliveries_;
   std::unordered_map<uint32_t, wgpu::Sampler> samplers_;
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
   std::unordered_map<std::string, wgpu::ShaderModule> modules_;
