@@ -59,6 +59,57 @@ PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* 
 /* counters, for a status line: draws, pipelines, shader errors */
 PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);
 
+/* The port's window (built with SDL3): both screens drawn by the engine's
+   device, the player's inputs, the console's sound. */
+typedef struct pn_window pn_window;
+
+/* a screen as the LCD controller scans it out: the framebuffer's physical
+   address (0: off), its color format (the low 3 bits of the register) and
+   the bytes from one column to the next (0: 240 pixels' worth) */
+typedef struct pn_screen {
+  uint32_t address, format, stride;
+} pn_screen;
+
+/* the buttons as the console's HID reports them */
+#define PN_A (1u << 0)
+#define PN_B (1u << 1)
+#define PN_SELECT (1u << 2)
+#define PN_START (1u << 3)
+#define PN_RIGHT (1u << 4)
+#define PN_LEFT (1u << 5)
+#define PN_UP (1u << 6)
+#define PN_DOWN (1u << 7)
+#define PN_R (1u << 8)
+#define PN_L (1u << 9)
+#define PN_X (1u << 10)
+#define PN_Y (1u << 11)
+#define PN_ZL (1u << 14)
+#define PN_ZR (1u << 15)
+
+typedef struct pn_input {
+  uint32_t buttons;
+  float circle_x, circle_y;   /* -1 to 1, up and right positive */
+  float c_stick_x, c_stick_y; /* the same */
+  uint16_t touch_x, touch_y;  /* in the bottom screen's pixels, when touching */
+  uint8_t touching;
+} pn_input;
+
+/* opens the window, 400x480 times scale, or null with the reason */
+PN_API pn_window* pn_window_open(pn_engine* engine, const char* title, uint32_t scale, char* error,
+                                 uint32_t error_size);
+PN_API void pn_window_close(pn_window* window);
+/* shows the top and bottom screens; waits for the display (vsync) */
+PN_API void pn_window_present(pn_window* window, const pn_screen screens[2]);
+/* reads the inputs; 0 once the player closed the window (or pressed Escape) */
+PN_API int pn_window_poll(pn_window* window, pn_input* input);
+/* plays stereo samples at the DSP's 32728 Hz, interleaved left, right */
+PN_API void pn_window_audio(pn_window* window, const int16_t* samples, uint32_t frames);
+PN_API void pn_window_title(pn_window* window, const char* title);
+/* the inputs the last pn_window_poll read, for code that reads them on its
+   own (a game's platform layer finding this export at run time); 0 before
+   any window polled */
+PN_API int pn_input_now(pn_input* input);
+
 #ifdef __cplusplus
 }
 #endif

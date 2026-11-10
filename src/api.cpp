@@ -1,8 +1,7 @@
 #define PICANATIVE_BUILDING
 #include "picanative/api.h"
 
-#include "picanative/gpu.hpp"
-#include "picanative/renderer.hpp"
+#include "engine.hpp"
 #include "picanative/transfer.hpp"
 
 #include <cstdio>
@@ -11,27 +10,6 @@
 #include <string>
 
 using namespace picanative;
-
-namespace {
-
-class HostMemory final : public Memory {
-public:
-  HostMemory(pn_map_fn map, void* user) : map_(map), user_(user) {}
-  uint8_t* map(uint32_t address, uint32_t size) override { return map_(user_, address, size); }
-
-private:
-  pn_map_fn map_;
-  void* user_;
-};
-
-} // namespace
-
-struct pn_engine {
-  HostMemory memory;
-  gpu::Context gpu;
-  std::unique_ptr<Renderer> renderer;
-  pn_engine(pn_map_fn map, void* user) : memory(map, user) {}
-};
 
 extern "C" {
 

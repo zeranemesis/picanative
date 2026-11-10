@@ -12,7 +12,17 @@ Thor.
 
 **État : le moteur rend Super Mario 3D Land sur PC**, du démarrage au niveau 1-1,
 comparé image par image à une implémentation de référence (voir les étapes dans
-[DESIGN.md](DESIGN.md)). Reste : la Thor (Android) et la fenêtre SDL3 propre au port.
+[DESIGN.md](DESIGN.md)), dans sa propre fenêtre SDL3. Reste : la Thor (Android).
+
+## La fenêtre
+
+Compilé avec SDL3, le moteur ouvre aussi la fenêtre du port (`pn_window_*`
+dans `include/picanative/api.h`) : les deux écrans dessinés par son propre
+device (directement depuis le GPU quand un transfert fait sur le GPU a produit
+l'image, sans relecture), le clavier, les manettes (A à droite, comme sur la
+3DS), l'écran tactile à la souris ou au doigt, et le son du DSP (32 728 Hz).
+Une couche plateforme qui lit elle-même les entrées les retrouve avec
+`pn_input_now`.
 
 ## Principes
 
@@ -40,7 +50,7 @@ MIT, voir [LICENSE](LICENSE).
 ## Compiler
 
 ```
-cmake -S . -B build -DCMAKE_PREFIX_PATH=<paquet Dawn précompilé, celui d'Aurora>
+cmake -S . -B build -DCMAKE_PREFIX_PATH=<paquet Dawn précompilé, celui d'Aurora> [-DSDL3_DIR=<SDL3 précompilé, celui d'Aurora>/cmake]
 cmake --build build --config Release
 build/Release/pn_optest <dossier de cas .pncase>
 build/Release/pn_state <trace.pntrace> [états.txt] [dessins.txt]

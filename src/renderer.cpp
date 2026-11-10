@@ -997,6 +997,7 @@ void Renderer::write_back(uint32_t address, uint32_t size, bool forget) {
 }
 
 void Renderer::forget_textures(uint32_t address, uint32_t size) {
+  std::erase_if(pictures_, [&](const Picture& p) { return address < p.address + p.size && p.address < address + size; });
   for (auto it = known_.begin(); it != known_.end();)
     if (address < it->second.address + it->second.bytes && it->second.address < address + size) it = known_.erase(it);
     else ++it;
@@ -1062,6 +1063,7 @@ void Renderer::display_transfer(uint32_t input, uint32_t output, uint32_t input_
   transfer_ranges(input_dimensions, output_dimensions, flags, input_bytes, output_bytes);
   if (cached_) {
     write_back(output, output_bytes, true);
+    forget_textures(output, output_bytes);
     if (gpu_transfer(input, output, input_dimensions, output_dimensions, flags)) {
       // PN_CHECK_TRANSFERS: each one also done by transfer.cpp, the bytes compared
       if (std::getenv("PN_CHECK_TRANSFERS")) {
@@ -1078,7 +1080,6 @@ void Renderer::display_transfer(uint32_t input, uint32_t output, uint32_t input_
             break;
           }
       }
-      forget_textures(output, output_bytes);
       return;
     }
     write_back(input, input_bytes, false);
@@ -1138,12 +1139,19 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   ++stats_.gpu_transfers;
 
   // write_back(output) delivered what overlapped: deliveries never overlap
+  pictures_.push_back({output, bytes, out});
   deliveries_.push_back({output, bytes, back,
                          back.MapAsync(wgpu::MapMode::Read, 0, bd.size, wgpu::CallbackMode::WaitAnyOnly,
                                        [](wgpu::MapAsyncStatus, wgpu::StringView) {})});
   // shortcut: a host that never reads its pictures back keeps up to 16 on the way
   if (deliveries_.size() > 16) deliver(deliveries_.front().address, 1);
   return true;
+}
+
+wgpu::Buffer Renderer::picture(uint32_t address, uint32_t size) const {
+  for (const Picture& p : pictures_)
+    if (p.address == address && size <= p.size) return p.buffer;
+  return nullptr;
 }
 
 void Renderer::deliver(uint32_t address, uint32_t size) {

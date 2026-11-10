@@ -35,6 +35,14 @@ target_link_libraries(picanative_api PRIVATE picanative_gpu)
 target_include_directories(picanative_api PUBLIC include)
 set_target_properties(picanative_api PROPERTIES OUTPUT_NAME picanative_engine)
 
+# the window (src/window.cpp), with SDL3 as Aurora ships it: through
+# CMAKE_PREFIX_PATH or SDL3_DIR
+find_package(SDL3 CONFIG)
+if (SDL3_FOUND)
+  target_sources(picanative_api PRIVATE src/window.cpp)
+  target_link_libraries(picanative_api PRIVATE SDL3::SDL3)
+endif ()
+
 # the tools run next to Dawn's libraries
 function(picanative_copy_dawn target)
   add_custom_command(TARGET ${target} POST_BUILD

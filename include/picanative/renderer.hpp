@@ -53,6 +53,13 @@ public:
 
   pica::CommandProcessor& processor() { return processor_; }
 
+  // The GPU buffer holding what memory holds at [address, address + size),
+  // when a display transfer done on the GPU wrote it and nothing has written
+  // there since (as far as the renderer is told); null otherwise. A window
+  // shows a screen from it without reading anything back.
+  wgpu::Buffer picture(uint32_t address, uint32_t size) const;
+  gpu::Context& gpu() { return gpu_; }
+
   struct Stats {
     uint64_t draws = 0, skipped = 0, passes = 0, pipelines = 0, textures_decoded = 0, flushes = 0;
     uint64_t shader_errors = 0, vertex_modules = 0, waiting = 0, gpu_transfers = 0; // waiting: draws skipped while their pipeline compiles
@@ -121,6 +128,11 @@ private:
     wgpu::Future mapped;
   };
   std::vector<Delivery> deliveries_;
+  struct Picture {
+    uint32_t address, size;
+    wgpu::Buffer buffer;
+  };
+  std::vector<Picture> pictures_;
   std::unordered_map<uint32_t, wgpu::Sampler> samplers_;
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
   std::unordered_map<std::string, wgpu::ShaderModule> modules_;
