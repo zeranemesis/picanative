@@ -30,6 +30,8 @@ inline constexpr uint32_t kRegGsBlock = 0x280, kRegVsBlock = 0x2B0, kShaderBlock
 // not the console's: a register past the shader blocks the PICA200 has nothing at, which a host's own functions
 // write in place of the commands a game's graphics library made: "run native operation n here" (on_native)
 inline constexpr uint32_t kRegNativeOperation = 0x2F0;
+// the same: what follows a mark where the game's block was, skipped unread (its extra words)
+inline constexpr uint32_t kRegNativeSkip = 0x2F1;
 
 // offsets inside a shader unit's block
 inline constexpr uint32_t kShaderBoolUniforms = 0x00, kShaderIntUniforms = 0x01, kShaderIntUniformsEnd = 0x04,

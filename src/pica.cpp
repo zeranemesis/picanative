@@ -51,6 +51,12 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     const bool consecutive = header >> 31;
     if (reg >= kRegisterCount) break; // not a command: the list is over
     const size_t available = std::min<size_t>(extra, words.size() - i);
+    if (reg == kRegNativeSkip) { // a host's padding where a block was: its words are not read
+      i += available;
+      if (extra % 2) ++i;
+      i = std::min(i, words.size());
+      continue;
+    }
     words_by_register[reg] += 1 + available;
     write(reg, first, mask);
     for (size_t k = 0; k < available; ++k) write(consecutive ? reg + 1 + static_cast<uint32_t>(k) : reg, words[i + k], mask);
