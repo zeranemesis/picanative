@@ -49,6 +49,10 @@ PN_API void pn_cpu_wrote(pn_engine* engine, uint32_t address, uint32_t size);
    order, with the mark's value, the host's own operation to run there */
 typedef void (*pn_native_fn)(void* user, uint32_t operation);
 PN_API void pn_set_native_operations(pn_engine* engine, pn_native_fn run, void* user);
+/* what a native operation sets, in place of commands: a register (a draw register draws, with the state as it is);
+   vertex shader float uniforms from `first`, four 32-bit floats each, w first as a command list carries them */
+PN_API void pn_write_register(pn_engine* engine, uint32_t reg, uint32_t value, uint32_t mask);
+PN_API void pn_vertex_uniforms(pn_engine* engine, uint32_t first, const uint32_t* words, uint32_t count);
 
 /* how far the engine may trust the host: PN_CACHE_SURFACES keeps what it
    draws on the GPU (the host routes every fill, transfer and copy through

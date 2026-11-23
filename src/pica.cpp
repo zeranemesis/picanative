@@ -175,6 +175,15 @@ void CommandProcessor::configure(ShaderUnit& unit, uint32_t offset, uint32_t val
   }
 }
 
+void CommandProcessor::vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count) {
+  if (!immediate_.empty()) flush_immediate();
+  for (uint32_t i = 0; i < count && first + i < kFloatUniforms; ++i) {
+    const uint32_t* w = words + i * 4;
+    state_.vs.float_uniforms[first + i] = {std::bit_cast<float>(w[3]), std::bit_cast<float>(w[2]),
+                                           std::bit_cast<float>(w[1]), std::bit_cast<float>(w[0])};
+  }
+}
+
 void CommandProcessor::upload_uniform(ShaderUnit& unit, uint32_t word) {
   // a vector comes as four 32-bit floats, or as four 24-bit floats packed in
   // three words, most significant first

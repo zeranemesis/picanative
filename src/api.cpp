@@ -58,6 +58,13 @@ void pn_set_native_operations(pn_engine* e, pn_native_fn run, void* user) {
   else e->renderer->processor().on_native = nullptr;
 }
 
+void pn_write_register(pn_engine* e, uint32_t reg, uint32_t value, uint32_t mask) {
+  e->renderer->processor().write(reg, value, mask);
+}
+void pn_vertex_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, uint32_t count) {
+  e->renderer->processor().vertex_uniforms(first, words, count);
+}
+
 void pn_times(pn_engine* e, double out[7]) {
   const auto& s = e->renderer->stats();
   const double times[7] = {s.record, s.textures, s.pipelines_time, s.encode, s.wait, s.store, s.load};
