@@ -3,6 +3,7 @@
 #include "picanative/memory.hpp"
 
 #include <array>
+#include <map>
 #include <vector>
 #include <cstdint>
 #include <functional>
@@ -94,6 +95,8 @@ public:
   std::function<void(uint32_t operation)> on_native;
   uint64_t draws = 0, immediate_vertices = 0, command_lists = 0;
   std::array<uint64_t, kRegisterCount> words_by_register{};
+  uint64_t jump_words = 0;
+  std::map<uint32_t, uint64_t> jump_targets;
 
   // for a native operation: a register set as a command would (a draw register draws)
   void write(uint32_t reg, uint32_t value, uint32_t mask);

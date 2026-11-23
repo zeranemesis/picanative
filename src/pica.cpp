@@ -60,6 +60,8 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     if (jump_) {
       jump_ = false;
       if (++jumps > 0x10000) break;
+      jump_words += jump_size_ / 4;
+      ++jump_targets[jump_address_];
       load(jump_address_, jump_size_);
       i = 0;
     }
@@ -76,9 +78,12 @@ void CommandProcessor::print_register_stats() const {
   for (uint32_t r = 0; r < kRegisterCount; ++r)
     if (words_by_register[r]) total += words_by_register[r], rows.emplace_back(words_by_register[r], r);
   std::sort(rows.rbegin(), rows.rend());
-  std::fprintf(stderr, "[picanative] %llu command words by register:\n", static_cast<unsigned long long>(total));
+  std::fprintf(stderr, "[picanative] %llu command words by register; %llu read through jumps, to %zu places:\n",
+               static_cast<unsigned long long>(total), static_cast<unsigned long long>(jump_words), jump_targets.size());
   for (size_t i = 0; i < rows.size() && i < 40; ++i)
     std::fprintf(stderr, "[picanative]   %03x %6.2f %%\n", rows[i].second, 100.0 * rows[i].first / total);
+  for (const auto& [address, n] : jump_targets)
+    std::fprintf(stderr, "[picanative]   jump to %08x: %llu times\n", address, static_cast<unsigned long long>(n));
 }
 
 void CommandProcessor::flush_immediate() {
