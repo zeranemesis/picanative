@@ -61,6 +61,7 @@ void pn_set_native_operations(pn_engine* e, pn_native_fn run, void* user) {
 void pn_write_register(pn_engine* e, uint32_t reg, uint32_t value, uint32_t mask) {
   e->renderer->processor().write(reg, value, mask);
 }
+void pn_print_register_stats(pn_engine* e) { e->renderer->processor().print_register_stats(); }
 void pn_vertex_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, uint32_t count) {
   e->renderer->processor().vertex_uniforms(first, words, count);
 }

@@ -74,6 +74,8 @@ struct State {
 class CommandProcessor {
 public:
   explicit CommandProcessor(Memory& memory);
+  // PN_REG_STATS set: the words written by register, to stderr
+  void print_register_stats() const;
 
   // Runs the command list at a physical address, following its jumps.
   void run(uint32_t address, uint32_t size);
@@ -91,6 +93,7 @@ public:
   // a native operation's mark (kRegNativeOperation), in the order the list has it
   std::function<void(uint32_t operation)> on_native;
   uint64_t draws = 0, immediate_vertices = 0, command_lists = 0;
+  std::array<uint64_t, kRegisterCount> words_by_register{};
 
   // for a native operation: a register set as a command would (a draw register draws)
   void write(uint32_t reg, uint32_t value, uint32_t mask);

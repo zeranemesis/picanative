@@ -1,5 +1,9 @@
 #include "picanative/pica.hpp"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+
 #include <bit>
 #include <cstring>
 #include <vector>
@@ -47,6 +51,7 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     const bool consecutive = header >> 31;
     if (reg >= kRegisterCount) break; // not a command: the list is over
     const size_t available = std::min<size_t>(extra, words.size() - i);
+    words_by_register[reg] += 1 + available;
     write(reg, first, mask);
     for (size_t k = 0; k < available; ++k) write(consecutive ? reg + 1 + static_cast<uint32_t>(k) : reg, words[i + k], mask);
     i += available;
@@ -61,6 +66,19 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
   }
   flush_immediate();
   ++command_lists;
+}
+
+void CommandProcessor::print_register_stats() const {
+  // PN_REG_STATS: which registers the command lists wrote, by words (what a host doing libraries natively has left)
+  if (!std::getenv("PN_REG_STATS")) return;
+  uint64_t total = 0;
+  std::vector<std::pair<uint64_t, uint32_t>> rows;
+  for (uint32_t r = 0; r < kRegisterCount; ++r)
+    if (words_by_register[r]) total += words_by_register[r], rows.emplace_back(words_by_register[r], r);
+  std::sort(rows.rbegin(), rows.rend());
+  std::fprintf(stderr, "[picanative] %llu command words by register:\n", static_cast<unsigned long long>(total));
+  for (size_t i = 0; i < rows.size() && i < 40; ++i)
+    std::fprintf(stderr, "[picanative]   %03x %6.2f %%\n", rows[i].second, 100.0 * rows[i].first / total);
 }
 
 void CommandProcessor::flush_immediate() {
