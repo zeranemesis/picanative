@@ -81,7 +81,9 @@ void CommandProcessor::write(uint32_t reg, uint32_t value, uint32_t mask) {
   const uint32_t merged = (regs[reg] & ~bits) | (value & bits);
   regs[reg] = merged;
 
-  if (reg == kRegDrawArrays || reg == kRegDrawElements) {
+  if (reg == kRegNativeOperation) {
+    if (on_native) on_native(merged);
+  } else if (reg == kRegDrawArrays || reg == kRegDrawElements) {
     ++draws;
     if (on_draw) on_draw(state_, reg == kRegDrawElements);
   } else if (reg == kRegCmdBufJump0 || reg == kRegCmdBufJump1) {

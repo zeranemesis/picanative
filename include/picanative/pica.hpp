@@ -26,6 +26,9 @@ inline constexpr uint32_t kRegCmdBufSize0 = 0x238, kRegCmdBufAddr0 = 0x23A, kReg
                           kRegCmdBufJump1 = 0x23D;
 inline constexpr uint32_t kRegVsAttributeCount = 0x242, kRegVsComMode = 0x244;
 inline constexpr uint32_t kRegGsBlock = 0x280, kRegVsBlock = 0x2B0, kShaderBlockSize = 0x2E;
+// not the console's: a register past the shader blocks the PICA200 has nothing at, which a host's own functions
+// write in place of the commands a game's graphics library made: "run native operation n here" (on_native)
+inline constexpr uint32_t kRegNativeOperation = 0x2F0;
 
 // offsets inside a shader unit's block
 inline constexpr uint32_t kShaderBoolUniforms = 0x00, kShaderIntUniforms = 0x01, kShaderIntUniformsEnd = 0x04,
@@ -85,6 +88,8 @@ public:
   // or the command list ends.
   using Vertex = std::array<Vec4, 16>;
   std::function<void(const State&, const std::vector<Vertex>&)> on_immediate;
+  // a native operation's mark (kRegNativeOperation), in the order the list has it
+  std::function<void(uint32_t operation)> on_native;
   uint64_t draws = 0, immediate_vertices = 0, command_lists = 0;
 
 private:

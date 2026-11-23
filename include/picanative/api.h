@@ -44,6 +44,12 @@ PN_API void pn_texture_copy(pn_engine* engine, uint32_t input, uint32_t output, 
 PN_API void pn_sync_for_cpu(pn_engine* engine, uint32_t address, uint32_t size);
 PN_API void pn_cpu_wrote(pn_engine* engine, uint32_t address, uint32_t size);
 
+/* a host that does a game's graphics library natively puts marks in the game's command lists in place of the
+   commands the library made (register 0x2F0, which the PICA200 has not): each one met calls this, in the list's
+   order, with the mark's value, the host's own operation to run there */
+typedef void (*pn_native_fn)(void* user, uint32_t operation);
+PN_API void pn_set_native_operations(pn_engine* engine, pn_native_fn run, void* user);
+
 /* how far the engine may trust the host: PN_CACHE_SURFACES keeps what it
    draws on the GPU (the host routes every fill, transfer and copy through
    the engine, and calls pn_sync_for_cpu / pn_cpu_wrote when the CPU touches
