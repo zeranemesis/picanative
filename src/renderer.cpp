@@ -146,13 +146,34 @@ constexpr const char* kDepthUploadWgsl = R"(
 
 // DisplayTransfer on the GPU: each invocation makes a word of the output,
 // byte for byte as transfer.cpp encodes it (little endian, linear lines).
-// p: output width, height, format | flip << 8 | first input line << 16, words.
+// p: output width, height (output pixels), format | flip << 8 | input format << 9 | (scale x - 1) << 12 |
+// (scale y - 1) << 13 | first input line << 16 | internal scale << 26, words. A downscale averages each 2x1 or
+// 2x2 block of the stored colors, rounding to nearest, as transfer.cpp.
 const char* kTransferWgsl = R"(
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<u32>;
 @group(0) @binding(2) var<uniform> p: vec4u;
-fn encoded(x: u32, y: u32, format: u32) -> u32 {
-  let c = vec4u(round(textureLoad(source, vec2u(x, y), 0) * 255.0));
+// the color as the surface's format in memory holds it (bits dropped, then widened back as the
+// transfer engine reads it), so that the output is what transfer.cpp makes from memory
+fn stored(c: vec4u, format: u32) -> vec4u {
+  switch format {
+    case 1u: { return vec4u(c.rgb, 255u); }
+    case 2u: {
+      let r = c.r >> 3u; let g = c.g >> 2u; let b = c.b >> 3u;
+      return vec4u((r << 3u) | (r >> 2u), (g << 2u) | (g >> 4u), (b << 3u) | (b >> 2u), 255u);
+    }
+    case 3u: {
+      let q = c.rgb >> vec3u(3u);
+      return vec4u((q << vec3u(3u)) | (q >> vec3u(2u)), select(0u, 255u, c.a >= 128u));
+    }
+    case 4u: { let q = c >> vec4u(4u); return (q << vec4u(4u)) | q; }
+    default: { return c; }
+  }
+}
+fn fetched(x: u32, y: u32) -> vec4u {
+  return stored(vec4u(round(textureLoad(source, vec2u(x, y), 0) * 255.0)), (p.z >> 9u) & 7u);
+}
+fn encoded(c: vec4u, format: u32) -> u32 {
   switch format {
     case 0u: { return c.a | (c.b << 8u) | (c.g << 16u) | (c.r << 24u); }
     case 1u: { return c.b | (c.g << 8u) | (c.r << 16u); }
@@ -168,6 +189,8 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
   let flip = ((p.z >> 8u) & 1u) != 0u;
   let first = (p.z >> 16u) & 1023u;
   let scale = p.z >> 26u; // one sample per block of the scaled surface
+  let sx = ((p.z >> 12u) & 1u) + 1u;
+  let sy = ((p.z >> 13u) & 1u) + 1u;
   let bpp = select(2u, select(3u, 4u, format == 0u), format <= 1u);
   var word = 0u;
   for (var b = 0u; b < 4u; b++) {
@@ -175,8 +198,16 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
     let pixel = at / bpp;
     if (pixel >= p.x * p.y) { break; }
     let line = pixel / p.x;
-    let y = first + select(line, p.y - 1u - line, flip);
-    word |= ((encoded((pixel % p.x) * scale, y * scale, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
+    let y = select(line, p.y - 1u - line, flip); // the copied line, from the first
+    var sum = vec4u(0u);
+    for (var dy = 0u; dy < sy; dy++) {
+      for (var dx = 0u; dx < sx; dx++) {
+        sum += fetched(((pixel % p.x) * sx + dx) * scale, (first + y * sy + dy) * scale);
+      }
+    }
+    let count = sx * sy;
+    let c = (sum + vec4u(count / 2u)) / vec4u(count);
+    word |= ((encoded(c, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
   }
   output[i] = word;
 }
@@ -187,9 +218,12 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
 struct Renderer::Surface {
   uint32_t address, width, height;
   bool depth;
-  // a color surface's format in memory (the GPU holds it as RGBA8); depth is D24S8
+  // a color surface's format in memory (the GPU holds it as RGBA8); a depth surface's, register 0x116:
+  // 0 D16, 2 D24, 3 D24S8 (the GPU holds all three as Depth32FloatStencil8)
   ColorFormat format = ColorFormat::RGBA8;
-  uint32_t bytes() const { return width * height * (depth ? 4 : bytes_per_pixel(format)); }
+  uint32_t depth_format = 3;
+  uint32_t pixel_bytes() const { return depth ? (depth_format == 0 ? 2 : depth_format == 2 ? 3 : 4) : bytes_per_pixel(format); }
+  uint32_t bytes() const { return width * height * pixel_bytes(); }
   wgpu::Texture texture;
   bool loaded = false; // holds what memory had, in this command list
   bool drawn = false;  // drawn into since, to write back
@@ -338,7 +372,8 @@ Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t 
   if (!slot) {
     slot = std::make_unique<Surface>();
     slot->address = address, slot->width = width, slot->height = height, slot->depth = depth;
-    slot->format = static_cast<ColorFormat>(format);
+    if (depth) slot->depth_format = format;
+    else slot->format = static_cast<ColorFormat>(format);
     wgpu::TextureDescriptor td{};
     td.size = {width * scale_, height * scale_, 1};
     td.format = depth ? wgpu::TextureFormat::Depth32FloatStencil8 : wgpu::TextureFormat::RGBA8Unorm;
@@ -355,7 +390,7 @@ void Renderer::load(Surface& s) {
   deliver(s.address, s.bytes());
   Timed timed{stats_.load};
   s.loaded = true;
-  const uint32_t bpp = s.depth ? 4 : bytes_per_pixel(s.format);
+  const uint32_t bpp = s.pixel_bytes();
   const uint8_t* bytes = memory_.map(s.address, s.width * s.height * bpp);
   const uint32_t n = scale_, sw = s.width * n, sh = s.height * n;
   // each of the console's pixels, repeated n x n
@@ -387,16 +422,18 @@ void Renderer::load(Surface& s) {
     gpu_.queue.WriteTexture(&dst, big.data(), big.size(), &layout, &extent);
     return;
   }
-  // D24S8: the stencil straight into its aspect, the depth by a pass
+  // the stencil straight into its aspect (0 without one), the depth by a pass, as 24 bits: D16 widened (v * 0xFFFFFF / 0xFFFF)
   std::vector<uint8_t> stencil(size_t{s.width} * s.height, 0);
   std::vector<uint32_t> depth(size_t{s.width} * s.height, 0);
   if (bytes)
     for (uint32_t y = 0; y < s.height; ++y)
       for (uint32_t x = 0; x < s.width; ++x) {
-        uint32_t word;
-        std::memcpy(&word, bytes + tiled_offset(x, y, s.width, 4), 4);
-        depth[size_t{y} * s.width + x] = word & 0xFFFFFF;
-        stencil[size_t{y} * s.width + x] = static_cast<uint8_t>(word >> 24);
+        uint32_t word = 0;
+        std::memcpy(&word, bytes + tiled_offset(x, y, s.width, bpp), bpp);
+        const size_t at = size_t{y} * s.width + x;
+        if (bpp == 2) depth[at] = word << 8 | word >> 8;
+        else depth[at] = word & 0xFFFFFF;
+        if (bpp == 4) stencil[at] = static_cast<uint8_t>(word >> 24);
       }
   const auto big_stencil = grow(stencil);
   const auto big_depth = grow(depth);
@@ -440,9 +477,15 @@ void Renderer::store(Surface& s, const std::vector<uint8_t>& data) {
     for (uint32_t x = 0; x < s.width; ++x) {
       float d;
       std::memcpy(&d, &data[size_t{y * n} * row + x * n * 4], 4);
+      const uint32_t bpp = s.pixel_bytes();
+      if (bpp == 2) {
+        const uint32_t d16 = static_cast<uint32_t>(std::lround(std::clamp(d, 0.0f, 1.0f) * 65535.0f)); // exact back
+        std::memcpy(bytes + tiled_offset(x, y, s.width, 2), &d16, 2);
+        continue;
+      }
       const uint32_t d24 = static_cast<uint32_t>(std::clamp(d, 0.0f, 1.0f) * 16777215.0f);
       const uint32_t word = d24 | uint32_t{data[stencil_at + size_t{y * n} * stencil_row + x * n]} << 24;
-      std::memcpy(bytes + tiled_offset(x, y, s.width, 4), &word, 4);
+      std::memcpy(bytes + tiled_offset(x, y, s.width, bpp), &word, bpp); // D24: its 3 low bytes
     }
 }
 
@@ -730,8 +773,8 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   // the color and depth buffers the draw renders into
   const uint32_t dims = r[0x11E], width = dims & 0x7FF, height = (dims >> 12 & 0x3FF) + 1;
   const uint32_t color_address = (r[0x11D] & 0x0FFFFFFF) << 3, depth_address = (r[0x11C] & 0x0FFFFFFF) << 3;
-  if (width == 0 || color_address == 0 || (r[0x116] & 3) != 3) {
-    // shortcut: D24S8 depth only so far, what SM3DL uses (the color formats are all there)
+  const uint32_t depth_format = r[0x116] & 3;
+  if (width == 0 || color_address == 0 || depth_format == 1) { // 1: no such depth format
     ++stats_.skipped;
     return;
   }
@@ -875,7 +918,7 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   // only when written back (shortcut: the console blends what the format kept)
   Surface& color = surface(color_address, width, height, false,
                            static_cast<uint32_t>(color_buffer_format(r[0x117] >> 16 & 7)));
-  Surface& depth = surface(depth_address, width, height, true);
+  Surface& depth = surface(depth_address, width, height, true, depth_format);
   load(color);
   load(depth);
   if (!color.drawn) forget_textures(color.address, color.bytes());
@@ -1126,19 +1169,20 @@ uint32_t copy_span(uint32_t size, uint32_t gap) {
 void Renderer::memory_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t width) {
   if (end <= start) return;
   deliver(start, end - start);
-  if (cached_ && width == 4) {
-    // a whole surface: cleared on the GPU, memory gets it if anything reads it
+  if (cached_) {
+    // a whole surface filled with pixels of its own size: cleared on the GPU, memory gets it if anything reads it
     for (auto& [key, s] : surfaces_) {
-      if (s->address != start || start + s->bytes() != end || (!s->depth && s->format != ColorFormat::RGBA8)) continue;
+      if (s->address != start || start + s->bytes() != end || s->pixel_bytes() != width) continue;
       PendingDraw clear{};
       clear.clear = true;
       if (s->depth) {
         clear.depth = s.get();
-        clear.clear_color[0] = static_cast<double>(value & 0xFFFFFF) / 16777215.0;
-        clear.stencil_reference = value >> 24;
+        clear.clear_color[0] = width == 2 ? static_cast<double>(value & 0xFFFF) / 65535.0
+                                          : static_cast<double>(value & 0xFFFFFF) / 16777215.0;
+        clear.stencil_reference = width == 4 ? value >> 24 : 0;
       } else {
         clear.color = s.get();
-        const Rgba c = decode(ColorFormat::RGBA8, reinterpret_cast<const uint8_t*>(&value));
+        const Rgba c = decode(s->format, reinterpret_cast<const uint8_t*>(&value));
         for (int k = 0; k < 4; ++k) clear.clear_color[k] = c[k] / 255.0;
       }
       pending_.push_back(clear);
@@ -1191,30 +1235,47 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   const uint32_t out_width = output_dimensions & 0xFFFF, out_height = output_dimensions >> 16;
   const bool flip = flags & 1, input_linear = flags & 2;
   const bool output_tiled = input_linear != ((flags & 0x20) != 0);
-  if (input_linear || output_tiled || (flags >> 24 & 3) != 0 || transfer_format(flags >> 8) != ColorFormat::RGBA8)
-    return false;
-  // as wide: a crop only drops lines, and never moves the output (transfer.cpp)
-  if (out_width != width || out_height > height || out_width == 0 || out_height == 0) return false;
+  // any color format: the surface's GPU texture is RGBA8 whatever memory holds, the shader stores it as memory would
+  const ColorFormat input_format = transfer_format(flags >> 8);
+  const uint32_t downscale = flags >> 24 & 3;
+  if (input_linear || output_tiled || downscale == 3) return false;
+  // the output dimensions count input pixels: a downscale divides them (transfer.cpp)
+  const uint32_t sx = downscale == 1 || downscale == 2 ? 2 : 1, sy = downscale == 2 ? 2 : 1;
+  const uint32_t copy_width = out_width / sx, copy_height = out_height / sy;
+  // the whole output written: a narrower output keeps the first pixels of each line (a crop), but a flipped crop
+  // moves the output (transfer.cpp), and what an output larger than the input leaves alone stays transfer.cpp's
+  if (copy_width == 0 || copy_height == 0 || copy_width * sx > width || copy_height * sy > height) return false;
+  if (flip && (flags & 4) && width > out_width) return false;
   // a color surface as wide holding the lines read: from its start, or from a
   // line of tiles down (a game drawing both screens into one buffer)
   Surface* found = nullptr;
   uint32_t first = 0;
   for (auto& [key, candidate] : surfaces_) {
-    const uint32_t tile_line = width * 8 * 4;
-    if (candidate->depth || candidate->format != ColorFormat::RGBA8 || candidate->width != width || !candidate->loaded ||
+    const uint32_t tile_line = width * 8 * bytes_per_pixel(input_format);
+    if (candidate->depth || candidate->format != input_format || candidate->width != width || !candidate->loaded ||
         input < candidate->address ||
         (input - candidate->address) % tile_line != 0)
       continue;
     const uint32_t line = (input - candidate->address) / tile_line * 8;
-    if (line + out_height > candidate->height) continue;
+    if (line + copy_height * sy > candidate->height) continue;
     found = candidate.get(), first = line;
     break;
   }
-  if (!found) return false;
+  if (!found) {
+    static int said = 0; // DEBUG-TRANSFER
+    const char* debug = std::getenv("PN_DEBUG_TRANSFER");
+    if (debug && said++ >= std::atoi(debug) && said < std::atoi(debug) + 6) {
+      std::fprintf(stderr, "[pn] no surface for transfer %08x %ux%u fmt %d:", input, width, height, int(input_format));
+      for (auto& [key, c] : surfaces_)
+        if (!c->depth) std::fprintf(stderr, " [%08x %ux%u fmt %d %s]", c->address, c->width, c->height, int(c->format), c->loaded ? "loaded" : "-");
+      std::fprintf(stderr, "\n");
+    }
+    return false;
+  }
   Surface& s = *found;
 
   const ColorFormat format = transfer_format(flags >> 12);
-  const uint32_t bpp = bytes_per_pixel(format), bytes = out_width * out_height * bpp;
+  const uint32_t bpp = bytes_per_pixel(format), bytes = copy_width * copy_height * bpp;
   const uint32_t words = (bytes + 3) / 4;
 
   submit({}); // the draws into the surface first
@@ -1224,7 +1285,11 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   const wgpu::Buffer out = gpu_.device.CreateBuffer(&bd);
   bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
   const wgpu::Buffer back = gpu_.device.CreateBuffer(&bd);
-  const uint32_t parameters[4] = {out_width, out_height, static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8 | first << 16 | scale_ << 26, words};
+  const uint32_t parameters[4] = {copy_width, copy_height,
+                                  static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8 |
+                                      static_cast<uint32_t>(input_format) << 9 | (sx - 1) << 12 | (sy - 1) << 13 |
+                                      first << 16 | scale_ << 26,
+                                  words};
   const wgpu::Buffer uniform = make_buffer(gpu_, parameters, sizeof parameters, wgpu::BufferUsage::Uniform);
   const wgpu::TextureView view = s.texture.CreateView();
   wgpu::BindGroupEntry e[3] = {};
@@ -1249,9 +1314,9 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
 
   // write_back(output) delivered what overlapped: deliveries never overlap
   wgpu::TextureView scaled;
-  if (scale_ > 1) { // what the window shows: the lines transferred, at the scale
+  if (scale_ > 1) { // what the window shows: the pixels transferred, at the scale (its filter averages a downscale)
     wgpu::TextureDescriptor td{};
-    td.size = {width * scale_, out_height * scale_, 1};
+    td.size = {copy_width * sx * scale_, copy_height * sy * scale_, 1};
     td.format = wgpu::TextureFormat::RGBA8Unorm;
     td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
     const wgpu::Texture copy = gpu_.device.CreateTexture(&td);
