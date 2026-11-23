@@ -60,6 +60,12 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     }
     words_by_register[reg] += 1 + available;
     if (reg == 0x200) ++attribute_lists[base];
+    // PN_DUMP_LIST=n: the commands the n-th command list (and its jumps) still has, to stderr
+    static const long dump_at = std::getenv("PN_DUMP_LIST") ? std::atol(std::getenv("PN_DUMP_LIST")) : -1;
+    if (dump_at >= 0 && static_cast<long>(command_lists) >= dump_at && static_cast<long>(command_lists) < dump_at + 12 &&
+        reg != kRegNativeOperation)
+      std::fprintf(stderr, "[dump] %08x +%04zx  %03x mask %x x%zu  %08x\n", base, (i - 2) * 4, reg, mask,
+                   available + 1, first);
     write(reg, first, mask);
     for (size_t k = 0; k < available; ++k) write(consecutive ? reg + 1 + static_cast<uint32_t>(k) : reg, words[i + k], mask);
     i += available;
