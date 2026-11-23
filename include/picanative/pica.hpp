@@ -99,6 +99,7 @@ public:
   std::array<uint64_t, kRegisterCount> words_by_register{};
   uint64_t jump_words = 0;
   std::map<uint32_t, uint64_t> jump_targets;
+  std::map<uint32_t, uint64_t> attribute_lists;
 
   // for a native operation: a register set as a command would (a draw register draws)
   void write(uint32_t reg, uint32_t value, uint32_t mask);

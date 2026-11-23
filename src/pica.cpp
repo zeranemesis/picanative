@@ -39,6 +39,7 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     if (const uint8_t* data = memory_.map(at, bytes / 4 * 4)) std::memcpy(words.data(), data, bytes / 4 * 4);
   };
   load(address, size);
+  uint32_t base = address; // the list the words come from, for the statistics
   uint32_t jumps = 0;
   jump_ = false;
   size_t i = 0;
@@ -58,6 +59,7 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
       continue;
     }
     words_by_register[reg] += 1 + available;
+    if (reg == 0x200) ++attribute_lists[base];
     write(reg, first, mask);
     for (size_t k = 0; k < available; ++k) write(consecutive ? reg + 1 + static_cast<uint32_t>(k) : reg, words[i + k], mask);
     i += available;
@@ -67,6 +69,7 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
       jump_ = false;
       if (++jumps > 0x10000) break;
       jump_words += jump_size_ / 4;
+      base = jump_address_;
       ++jump_targets[jump_address_];
       load(jump_address_, jump_size_);
       i = 0;
@@ -88,6 +91,9 @@ void CommandProcessor::print_register_stats() const {
                static_cast<unsigned long long>(total), static_cast<unsigned long long>(jump_words), jump_targets.size());
   for (size_t i = 0; i < rows.size() && i < 40; ++i)
     std::fprintf(stderr, "[picanative]   %03x %6.2f %%\n", rows[i].second, 100.0 * rows[i].first / total);
+  for (const auto& [address, n] : attribute_lists)
+    std::fprintf(stderr, "[picanative]   0x200 written by the list at %08x: %llu times\n", address,
+                 static_cast<unsigned long long>(n));
   for (const auto& [address, n] : jump_targets)
     std::fprintf(stderr, "[picanative]   jump to %08x: %llu times\n", address, static_cast<unsigned long long>(n));
 }
