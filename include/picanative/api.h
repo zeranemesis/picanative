@@ -60,6 +60,15 @@ PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* 
    always gets the console's pixels; the window shows the scaled pictures. */
 PN_API void pn_set_resolution_scale(pn_engine* engine, uint32_t scale);
 
+/* Vertex programs translated ahead of time (by pn_shaders, from the game's
+   shader binaries): loaded before the first command list, they are not
+   translated while the game runs. 0 with the reason in error, for a missing
+   file or one another build of picanative made. */
+PN_API int pn_load_shaders(pn_engine* engine, const char* path, char* error, uint32_t error_size);
+/* vertex programs loaded ahead, translated while running (each logged), and
+   the microseconds those translations took */
+PN_API void pn_shader_stats(pn_engine* engine, uint64_t out[3]);
+
 /* counters, for a status line: draws, pipelines, shader errors */
 PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);
 /* where the engine's time went, in seconds: recording draws (of which

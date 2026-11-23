@@ -58,4 +58,13 @@ build/Release/pn_shadertest <dossier de cas .pnvs>
 build/Release/pn_texturetest <dossier de cas .pntx>
 build/Release/pn_render [--cached] <trace.pntrace> [dossier d'images]
 build/Release/pn_stats <trace.pntrace>
+build/Release/pn_shaders <traductions.pnvs> <binaire de shaders DVLB, ou dossier>...
 ```
+
+`pn_shaders` traduit à l'avance les programmes de sommets des binaires de
+shaders d'un jeu (`.shbin`, ou les blocs DVLB trouvés dans ses données) ; le
+moteur charge le fichier avec `pn_load_shaders` et ne traduit plus que les
+programmes absents (journalisés, comptés par `pn_shader_stats`). Un programme
+est reconnu par ses seules instructions atteignables depuis son point d'entrée,
+pas par ce que les programmes précédents ont laissé dans l'unité.
+`PN_CHECK_SHADERS=1` compare chaque traduction chargée à celle faite sur place.

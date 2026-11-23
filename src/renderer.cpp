@@ -11,7 +11,9 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 namespace picanative {
 namespace {
@@ -653,6 +655,14 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   return slot->view;
 }
 
+bool Renderer::load_translations(const std::string& path, std::string& error) {
+  shadergen::Translations loaded;
+  if (!shadergen::load_translations(path, loaded, error)) return false;
+  stats_.programs_ahead += loaded.size();
+  translations_.merge(loaded);
+  return true;
+}
+
 wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::ShaderUnit& vs) {
   const std::vector<uint32_t> key = c.key();
   std::string id(reinterpret_cast<const char*>(key.data()), key.size() * 4);
@@ -664,7 +674,28 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
   }
   ++stats_.pipelines;
   Timed timed{stats_.pipelines_time};
-  const std::string vertex_source = draw::vertex_wgsl(c, vs), fragment_source = draw::fragment_wgsl(c);
+  auto program = translations_.find(c.program);
+  // PN_CHECK_SHADERS=1: each program translated ahead against its translation now, and against the
+  // translation of the whole unit (what the engine translated before it kept only what is reachable)
+  static const bool check = std::getenv("PN_CHECK_SHADERS") != nullptr;
+  if (check && program != translations_.end() && checked_.insert(c.program).second) {
+    const std::string now = shadergen::vertex_function(vs, "vsu"), whole = shadergen::vertex_function(vs, "vsu", true);
+    std::fprintf(stderr, "[picanative] check %016llx: ahead %s now, %s the whole unit\n",
+                 static_cast<unsigned long long>(c.program), program->second == now ? "==" : "!=",
+                 program->second == whole ? "==" : "!=");
+    if (program->second != whole) // both, in the current folder
+      for (const auto& [name, text] : {std::pair{"ahead", program->second}, std::pair{"whole", whole}})
+        std::ofstream(std::to_string(c.program) + "-" + name + ".wgsl") << text;
+  }
+  if (program == translations_.end()) {
+    Timed translating{stats_.translating};
+    ++stats_.programs_translated;
+    if (stats_.programs_ahead)
+      std::fprintf(stderr, "[picanative] vertex program %016llx (entry %u) not translated ahead: translating it\n",
+                   static_cast<unsigned long long>(c.program), vs.entry_point);
+    program = translations_.emplace(c.program, shadergen::vertex_function(vs, "vsu")).first;
+  }
+  const std::string vertex_source = draw::vertex_wgsl(c, program->second), fragment_source = draw::fragment_wgsl(c);
   const std::string source = vertex_source + fragment_source; // for error reports
   wgpu::RenderPipeline result;
   const std::string error = gpu::checked(gpu_, [&] {

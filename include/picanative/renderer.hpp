@@ -4,6 +4,7 @@
 #include "picanative/gpu.hpp"
 #include "picanative/memory.hpp"
 #include "picanative/pica.hpp"
+#include "picanative/shadergen.hpp"
 
 #include <array>
 #include <cstdint>
@@ -75,6 +76,9 @@ public:
   struct Stats {
     uint64_t draws = 0, skipped = 0, passes = 0, pipelines = 0, textures_decoded = 0, flushes = 0;
     uint64_t shader_errors = 0, vertex_modules = 0, waiting = 0, gpu_transfers = 0; // waiting: draws skipped while their pipeline compiles
+    // vertex programs: translations loaded (load_translations), programs translated while running
+    uint64_t programs_ahead = 0, programs_translated = 0;
+    double translating = 0; // seconds, part of pipelines_time
     // where the time goes, in seconds
     double record = 0, textures = 0, pipelines_time = 0, encode = 0, wait = 0, load = 0, store = 0;
   };
@@ -84,6 +88,10 @@ public:
   // ready yet are skipped (for a game: no stall; tools comparing pictures
   // keep the default, compiling as it goes).
   void set_async_pipelines(bool on) { async_ = on; }
+
+  // Vertex programs translated ahead of time (shadergen::save_translations):
+  // those are not translated again; any other the game runs is, and logged.
+  bool load_translations(const std::string& path, std::string& error);
 
   // the first WGSL compile errors, for diagnosis
   std::vector<std::string> errors;
@@ -155,6 +163,8 @@ private:
   std::unordered_map<uint32_t, wgpu::Sampler> samplers_;
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
   std::unordered_map<std::string, wgpu::ShaderModule> modules_;
+  shadergen::Translations translations_; // program_key -> vertex_function(.., "vsu")
+  std::set<uint64_t> checked_;           // PN_CHECK_SHADERS
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool, uint32_t>, std::unique_ptr<Surface>> surfaces_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
   // cached mode: the texture each (address, format, size, levels) decoded to,

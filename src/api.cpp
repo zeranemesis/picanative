@@ -59,6 +59,20 @@ void pn_times(pn_engine* e, double out[7]) {
   for (int i = 0; i < 7; ++i) out[i] = times[i];
 }
 
+int pn_load_shaders(pn_engine* e, const char* path, char* error, uint32_t error_size) {
+  std::string message;
+  if (e->renderer->load_translations(path, message)) return 1;
+  if (error && error_size) std::snprintf(error, error_size, "%s", message.c_str());
+  return 0;
+}
+
+void pn_shader_stats(pn_engine* e, uint64_t out[3]) {
+  const auto& s = e->renderer->stats();
+  out[0] = s.programs_ahead;
+  out[1] = s.programs_translated;
+  out[2] = static_cast<uint64_t>(s.translating * 1e6);
+}
+
 void pn_stats(pn_engine* e, uint64_t out[3]) {
   const auto& s = e->renderer->stats();
   out[0] = s.draws;

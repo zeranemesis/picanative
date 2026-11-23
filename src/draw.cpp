@@ -488,13 +488,13 @@ const char* kVOut = R"(struct VOut {
 
 } // namespace
 
-std::string vertex_wgsl(const Config& c, const pica::ShaderUnit& vs) {
+std::string vertex_wgsl(const Config& c, const std::string& program) {
   std::ostringstream w;
   w << shadergen::kVertexUniformsWgsl;
   w << kDrawStruct;
   w << "@group(0) @binding(0) var<uniform> vsu: PicaVsUniforms;\n"
        "@group(0) @binding(2) var<storage, read> arena: array<u32>;\n";
-  w << shadergen::vertex_function(vs, "vsu");
+  w << program;
   w << kVOut;
   w << "fn rb(a: u32) -> u32 { return (arena[a >> 2u] >> ((a & 3u) * 8u)) & 0xFFu; }\n"
        "fn r16(a: u32) -> u32 { return rb(a) | (rb(a + 1u) << 8u); }\n"

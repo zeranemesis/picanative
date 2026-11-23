@@ -63,7 +63,8 @@ Config configure(const pica::State& state, const vertex::Layout& layout, bool in
 // The WGSL modules of a pipeline, entry points `vs` and `fs`, with the
 // bindings documented in draw.cpp. Separate, so that a vertex shader shared by
 // many pipelines compiles once.
-std::string vertex_wgsl(const Config& config, const pica::ShaderUnit& vertex_unit);
+// program: shadergen::vertex_function of the draw's unit, with the uniforms named "vsu"
+std::string vertex_wgsl(const Config& config, const std::string& program);
 std::string fragment_wgsl(const Config& config);
 
 // Uniform block of a draw, as the WGSL `Draw` struct lays it out: everything
