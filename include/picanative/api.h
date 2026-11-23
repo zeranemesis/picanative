@@ -52,6 +52,11 @@ PN_API void pn_set_native_operations(pn_engine* engine, pn_native_fn run, void* 
 /* what a native operation sets, in place of commands: a register (a draw register draws, with the state as it is);
    vertex shader float uniforms from `first`, four 32-bit floats each, w first as a command list carries them */
 PN_API void pn_write_register(pn_engine* engine, uint32_t reg, uint32_t value, uint32_t mask);
+/* a whole native operation in one call: steps of
+     reg | mask << 16, value                                  a register
+     0x80000000 | geometry << 15 | first << 8 | rows, 4 words a row (w first)   float uniforms
+     0xC0000000 | mask << 16 | reg, count, count values       one register written count times */
+PN_API void pn_run_program(pn_engine* engine, const uint32_t* words, uint32_t count);
 /* PN_REG_STATS set: the command words written so far, by register, to stderr */
 PN_API void pn_print_register_stats(pn_engine* engine);
 PN_API void pn_vertex_uniforms(pn_engine* engine, uint32_t first, const uint32_t* words, uint32_t count);
@@ -89,6 +94,8 @@ PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);
    textures, then pipelines), encoding, waiting for the GPU (of which storing
    to memory), loading from memory */
 PN_API void pn_times(pn_engine* engine, double out[7]);
+/* of the textures' time: write-backs, known ones found, hashing, decoding (seconds); calls */
+PN_API void pn_texture_times(pn_engine* engine, double out[4], uint64_t calls[2]); /* lookups, decodes */
 
 /* The port's window (built with SDL3): both screens drawn by the engine's
    device, the player's inputs, the console's sound. */

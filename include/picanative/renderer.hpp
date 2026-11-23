@@ -81,6 +81,9 @@ public:
     double translating = 0; // seconds, part of pipelines_time
     // where the time goes, in seconds
     double record = 0, textures = 0, pipelines_time = 0, encode = 0, wait = 0, load = 0, store = 0;
+    // of textures: making memory current (write_back), finding a known one, hashing, decoding; texture() calls
+    double tex_writeback = 0, tex_known = 0, tex_hash = 0, tex_decode = 0;
+    uint64_t tex_calls = 0, textures_updated = 0; // updated: in part, in place
   };
   const Stats& stats() const { return stats_; }
 
@@ -174,6 +177,12 @@ private:
     Texture* texture;
   };
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, Known> known_;
+  // large textures: their last content and key, to send only what changed next time
+  struct Previous {
+    uint64_t key;
+    std::vector<uint8_t> bytes;
+  };
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, Previous> previous_;
 
   // what the pending draws need, uploaded when they run
   std::vector<PendingDraw> pending_;

@@ -58,8 +58,20 @@ void light_color(uint32_t v, float out[4]) {
 float fixed13(uint32_t v) { return static_cast<float>(static_cast<int32_t>((v & 0x1FFF) << 19) >> 19) / 2047.0f; }
 
 uint64_t fnv(const uint8_t* data, size_t size, uint64_t hash = 0xCBF29CE484222325ull) {
-  // whole words where possible, the hash only has to tell contents apart
+  // whole words where possible, the hash only has to tell contents apart. Four lanes side by side: each
+  // multiplication waits only on its own lane's last, so the processor runs four at once (textures are hashed
+  // every command list: this was most of the time spent on them)
   size_t i = 0;
+  if (size >= 64) {
+    uint64_t lane[4] = {hash, hash ^ 0x9E3779B97F4A7C15ull, hash ^ 0xBF58476D1CE4E5B9ull, hash ^ 0x94D049BB133111EBull};
+    for (; i + 32 <= size; i += 32) {
+      uint64_t w[4];
+      std::memcpy(w, data + i, 32);
+      for (int k = 0; k < 4; ++k) lane[k] = (lane[k] ^ w[k]) * 0x100000001B3ull;
+    }
+    hash = lane[0];
+    for (int k = 1; k < 4; ++k) hash = (hash ^ lane[k] ^ (lane[k] >> 29)) * 0x100000001B3ull;
+  }
   for (; i + 8 <= size; i += 8) {
     uint64_t word;
     std::memcpy(&word, data + i, 8);
@@ -357,8 +369,21 @@ void Renderer::command_list(uint32_t address, uint32_t size) {
       else ++it;
   }
   // the CPU may have changed textures since the last list unless the host
-  // reports its writes; within a list it cannot
-  if (!trusted_) known_.clear();
+  // reports its writes; within a list it cannot. VRAM is the exception: what
+  // writes it (DMA, fills, transfers, copies, the GPU) goes through the engine,
+  // which forgets the textures there; so a VRAM texture stays known, unless a
+  // surface overlaps it (the GPU may draw into it again in this list).
+  // shortcut: the CPU writing VRAM directly goes unseen; no game seen does,
+  // keep this clear() for one that does (PN_TRUST_CPU_WRITES aside)
+  if (!trusted_) {
+    for (auto it = known_.begin(); it != known_.end();) {
+      const Known& k = it->second;
+      bool keep = k.address >= 0x18000000 && k.address + k.bytes <= 0x18600000;
+      for (const auto& [key, s] : surfaces_)
+        if (keep && k.address < s->address + s->bytes() && s->address < k.address + k.bytes) keep = false;
+      it = keep ? std::next(it) : known_.erase(it);
+    }
+  }
   processor_.run(address, size);
   if (cached_) {
     flush(false);
@@ -604,14 +629,20 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   lod[2] = static_cast<float>(max);
   lod[3] = static_cast<float>((config >> 2 & 1) | (config >> 24 & 1) << 1);
 
+  ++stats_.tex_calls;
   uint32_t bytes = 0;
   for (uint32_t l = 0; l < levels; ++l) bytes += texture::size(format, std::max(width >> l, 1u), std::max(height >> l, 1u));
   // drawn into in this command list: memory has to get it first
-  write_back(address, bytes, false);
   {
+    Timed t{stats_.tex_writeback};
+    write_back(address, bytes, false);
+  }
+  {
+    Timed t{stats_.tex_known};
     const auto found = known_.find({address, format, width | height << 16, levels});
     if (found != known_.end()) return found->second.texture->view;
   }
+  Timed hashing{stats_.tex_hash};
   const uint8_t* data = memory_.map(address, bytes);
   std::vector<uint8_t> copy;
   if (!data) {
@@ -626,8 +657,64 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   auto& slot = textures_[key];
   if (slot) known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
   if (slot) return slot->view;
+  Timed decoding{stats_.tex_decode};
+  // a large texture the game changes in part (an atlas it streams tiles into): the rows of 8x8 tiles that
+  // changed, decoded and sent alone, into the same GPU texture (once the work using its old content is sent)
+  const auto place = std::tuple{address, format, width | height << 16, levels};
+  constexpr uint32_t kPartial = 0x40000;
+  const uint32_t row_bytes = texture::size(format, width, 8), rows = height / 8;
+  if (bytes >= kPartial && levels == 1 && rows && row_bytes * rows == bytes) {
+    const auto before = previous_.find(place);
+    if (before != previous_.end()) {
+      const auto old = textures_.find(before->second.key);
+      if (old != textures_.end() && old->second && before->second.bytes.size() == bytes) {
+        std::vector<uint32_t> changed;
+        for (uint32_t r = 0; r < rows; ++r)
+          if (std::memcmp(data + size_t{r} * row_bytes, before->second.bytes.data() + size_t{r} * row_bytes, row_bytes))
+            changed.push_back(r);
+        if (changed.size() * 2 <= rows) {
+          if (!pending_.empty()) flush(false); // draws recorded with the old content first
+          slot = std::move(old->second);
+          textures_.erase(old);
+          std::vector<uint8_t> rgba;
+          for (size_t i = 0; i < changed.size();) {
+            size_t j = i + 1;
+            while (j < changed.size() && changed[j] == changed[j - 1] + 1) ++j;
+            const uint32_t first = changed[i], count = static_cast<uint32_t>(j - i);
+            texture::decode(format, data + size_t{first} * row_bytes, size_t{count} * row_bytes, width, count * 8, rgba);
+            wgpu::TexelCopyTextureInfo dst{};
+            dst.texture = slot->texture;
+            dst.origin = {0, first * 8, 0};
+            wgpu::TexelCopyBufferLayout layout{};
+            layout.bytesPerRow = width * 4;
+            layout.rowsPerImage = count * 8;
+            wgpu::Extent3D extent{width, count * 8, 1};
+            gpu_.queue.WriteTexture(&dst, rgba.data(), rgba.size(), &layout, &extent);
+            i = j;
+          }
+          ++stats_.textures_updated;
+          before->second.key = key;
+          before->second.bytes.assign(data, data + bytes);
+          known_[place] = {address, bytes, slot.get()};
+          return slot->view;
+        }
+      }
+    }
+  }
   slot = std::make_unique<Texture>();
   ++stats_.textures_decoded;
+  // PN_TEXTURE_LOG: which textures are decoded again and again (address, format, size, drawn there by the GPU?)
+  static const bool log = std::getenv("PN_TEXTURE_LOG") != nullptr;
+  if (log) {
+    static std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint64_t> decoded;
+    const uint64_t n = ++decoded[{address, format, width | height << 16}];
+    bool surface = false;
+    for (const auto& [k, s] : surfaces_)
+      if (address < s->address + s->bytes() && s->address < address + bytes) surface = true;
+    if (n == 10 || n == 100 || n == 1000 || n == 10000)
+      std::fprintf(stderr, "[picanative] texture %08x format %u %ux%u decoded %llu times%s\n", address, format, width,
+                   height, static_cast<unsigned long long>(n), surface ? " (a surface the GPU draws)" : "");
+  }
   wgpu::TextureDescriptor td{};
   td.size = {width, height, 1};
   td.mipLevelCount = levels;
@@ -652,6 +739,7 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   }
   slot->view = slot->texture.CreateView();
   known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
+  if (bytes >= kPartial && levels == 1) previous_[place] = {key, std::vector<uint8_t>(data, data + bytes)};
   return slot->view;
 }
 

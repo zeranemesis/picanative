@@ -105,6 +105,8 @@ public:
   void write(uint32_t reg, uint32_t value, uint32_t mask);
   // vertex (or geometry) shader float uniforms from `first`, each four 32-bit floats as a command list carries them (w first)
   void vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count, bool geometry = false);
+  // a native operation's program, in one call (pn_run_program's steps)
+  void run_program(const uint32_t* words, size_t count);
 
 private:
   void flush_immediate();

@@ -71,24 +71,48 @@ void decode(uint32_t format, const uint8_t* data, size_t length, uint32_t width,
   out.assign(size_t{width} * height * 4, 0);
   auto in = [&](size_t offset, size_t bytes) { return offset + bytes <= length; };
   if (format == 12 || format == 13) {
-    // 8x8 tiles row by row, four 4x4 blocks per tile in Z order
+    // 8x8 tiles row by row, four 4x4 blocks per tile in Z order; a block's
+    // colours worked out once for its 16 texels (what etc1() does per texel)
     const uint32_t block_size = format == 13 ? 16 : 8;
-    for (uint32_t y = 0; y < height; ++y)
-      for (uint32_t x = 0; x < width; ++x) {
-        const uint32_t tile = y / 8 * std::max(width / 8, 1u) + x / 8;
-        const uint32_t sub = x % 8 / 4 + 2 * (y % 8 / 4);
+    for (uint32_t by = 0; by < height; by += 4)
+      for (uint32_t bx = 0; bx < width; bx += 4) {
+        const uint32_t tile = by / 8 * std::max(width / 8, 1u) + bx / 8;
+        const uint32_t sub = bx % 8 / 4 + 2 * (by % 8 / 4);
         const size_t offset = size_t{tile * 4 + sub} * block_size;
-        uint8_t* o = &out[(size_t{y} * width + x) * 4];
         if (!in(offset, block_size)) continue;
         const uint8_t* block = data + offset;
-        etc1(block + (format == 13 ? 8 : 0), x % 4, y % 4, o);
-        if (format == 13) {
-          uint64_t alpha;
-          std::memcpy(&alpha, block, 8);
-          o[3] = e4(alpha >> ((x % 4 * 4 + y % 4) * 4) & 0xF);
+        const uint8_t* colour = block + (format == 13 ? 8 : 0);
+        uint32_t low, high;
+        std::memcpy(&low, colour, 4);
+        std::memcpy(&high, colour + 4, 4);
+        const bool flip = high & 1, diff = high & 2;
+        int base[2][3];
+        if (diff) {
+          const int r = high >> 27 & 0x1F, g = high >> 19 & 0x1F, b = high >> 11 & 0x1F;
+          const int c0[3] = {r, g, b};
+          const int d[3] = {extend3(high >> 24 & 7), extend3(high >> 16 & 7), extend3(high >> 8 & 7)};
+          for (int c = 0; c < 3; ++c) {
+            base[0][c] = e5(static_cast<uint32_t>(c0[c]));
+            base[1][c] = e5(static_cast<uint32_t>(std::clamp(c0[c] + d[c], 0, 31)));
+          }
         } else {
-          o[3] = 0xFF;
+          for (int c = 0; c < 3; ++c) {
+            base[0][c] = e4(high >> (28 - c * 8) & 0xF);
+            base[1][c] = e4(high >> (24 - c * 8) & 0xF);
+          }
         }
+        const int tables[2] = {static_cast<int>(high >> 5 & 7), static_cast<int>(high >> 2 & 7)};
+        uint64_t alpha = 0;
+        if (format == 13) std::memcpy(&alpha, block, 8);
+        for (uint32_t yy = 0; yy < 4 && by + yy < height; ++yy)
+          for (uint32_t xx = 0; xx < 4 && bx + xx < width; ++xx) {
+            uint8_t* o = &out[(size_t{by + yy} * width + bx + xx) * 4];
+            const int half = (flip ? yy < 2 : xx < 2) ? 0 : 1;
+            const uint32_t index = xx * 4 + yy; // the index planes are column-major
+            const int delta = kEtcModifiers[tables[half]][(low >> (index + 16) & 1) << 1 | (low >> index & 1)];
+            for (int c = 0; c < 3; ++c) o[c] = static_cast<uint8_t>(std::clamp(base[half][c] + delta, 0, 255));
+            o[3] = format == 13 ? e4(alpha >> (index * 4) & 0xF) : 0xFF;
+          }
       }
     return;
   }

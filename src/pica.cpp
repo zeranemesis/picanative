@@ -216,6 +216,24 @@ void CommandProcessor::configure(ShaderUnit& unit, uint32_t offset, uint32_t val
   }
 }
 
+void CommandProcessor::run_program(const uint32_t* w, size_t n) {
+  for (size_t i = 0; i < n;) {
+    const uint32_t step = w[i];
+    if ((step >> 30) == 3) { // one register, many values (uniform data, program code, a table)
+      const uint32_t reg = step & 0xFFFF, mask = step >> 16 & 0xF, count = i + 1 < n ? w[i + 1] : 0;
+      for (uint32_t k = 0; k < count && i + 2 + k < n; ++k) write(reg, w[i + 2 + k], mask);
+      i += 2 + count;
+    } else if (step >> 31) { // float uniforms, vertex or geometry
+      const uint32_t first = step >> 8 & 0x7F, rows = step & 0xFF;
+      if (i + 1 + rows * 4 <= n) vertex_uniforms(first, w + i + 1, rows, (step >> 15 & 1) != 0);
+      i += 1 + rows * 4;
+    } else { // a register
+      if (i + 1 < n) write(step & 0xFFFF, w[i + 1], step >> 16 & 0xF);
+      i += 2;
+    }
+  }
+}
+
 void CommandProcessor::vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count, bool geometry) {
   if (!immediate_.empty()) flush_immediate();
   ShaderUnit& unit = geometry ? state_.gs : state_.vs;
