@@ -204,12 +204,13 @@ void CommandProcessor::configure(ShaderUnit& unit, uint32_t offset, uint32_t val
   }
 }
 
-void CommandProcessor::vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count) {
+void CommandProcessor::vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count, bool geometry) {
   if (!immediate_.empty()) flush_immediate();
+  ShaderUnit& unit = geometry ? state_.gs : state_.vs;
   for (uint32_t i = 0; i < count && first + i < kFloatUniforms; ++i) {
     const uint32_t* w = words + i * 4;
-    state_.vs.float_uniforms[first + i] = {std::bit_cast<float>(w[3]), std::bit_cast<float>(w[2]),
-                                           std::bit_cast<float>(w[1]), std::bit_cast<float>(w[0])};
+    unit.float_uniforms[first + i] = {std::bit_cast<float>(w[3]), std::bit_cast<float>(w[2]),
+                                      std::bit_cast<float>(w[1]), std::bit_cast<float>(w[0])};
   }
 }
 

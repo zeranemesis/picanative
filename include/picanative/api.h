@@ -55,6 +55,8 @@ PN_API void pn_write_register(pn_engine* engine, uint32_t reg, uint32_t value, u
 /* PN_REG_STATS set: the command words written so far, by register, to stderr */
 PN_API void pn_print_register_stats(pn_engine* engine);
 PN_API void pn_vertex_uniforms(pn_engine* engine, uint32_t first, const uint32_t* words, uint32_t count);
+/* the same for the geometry shader */
+PN_API void pn_geometry_uniforms(pn_engine* engine, uint32_t first, const uint32_t* words, uint32_t count);
 
 /* how far the engine may trust the host: PN_CACHE_SURFACES keeps what it
    draws on the GPU (the host routes every fill, transfer and copy through

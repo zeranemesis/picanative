@@ -102,8 +102,8 @@ public:
 
   // for a native operation: a register set as a command would (a draw register draws)
   void write(uint32_t reg, uint32_t value, uint32_t mask);
-  // vertex shader float uniforms from `first`, each four 32-bit floats as a command list carries them (w first)
-  void vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count);
+  // vertex (or geometry) shader float uniforms from `first`, each four 32-bit floats as a command list carries them (w first)
+  void vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count, bool geometry = false);
 
 private:
   void flush_immediate();

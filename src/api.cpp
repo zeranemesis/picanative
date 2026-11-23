@@ -66,6 +66,10 @@ void pn_vertex_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, uin
   e->renderer->processor().vertex_uniforms(first, words, count);
 }
 
+void pn_geometry_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, uint32_t count) {
+  e->renderer->processor().vertex_uniforms(first, words, count, true);
+}
+
 void pn_times(pn_engine* e, double out[7]) {
   const auto& s = e->renderer->stats();
   const double times[7] = {s.record, s.textures, s.pipelines_time, s.encode, s.wait, s.store, s.load};
