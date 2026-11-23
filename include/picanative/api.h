@@ -95,7 +95,7 @@ PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);
    to memory), loading from memory */
 PN_API void pn_times(pn_engine* engine, double out[7]);
 /* of the textures' time: write-backs, known ones found, hashing, decoding (seconds); calls */
-PN_API void pn_texture_times(pn_engine* engine, double out[4], uint64_t calls[2]); /* lookups, decodes */
+PN_API void pn_texture_times(pn_engine* engine, double out[4], uint64_t calls[4]); /* lookups, decodes, submits, passes */
 
 /* The port's window (built with SDL3): both screens drawn by the engine's
    device, the player's inputs, the console's sound. */

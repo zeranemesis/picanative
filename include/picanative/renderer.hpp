@@ -84,6 +84,8 @@ public:
     // of textures: making memory current (write_back), finding a known one, hashing, decoding; texture() calls
     double tex_writeback = 0, tex_known = 0, tex_hash = 0, tex_decode = 0;
     uint64_t tex_calls = 0, textures_updated = 0; // updated: in part, in place
+    double submit_buffers = 0, submit_draws = 0; // of encoding: the buffers made, the draws encoded
+    uint64_t submit_bytes = 0, arena_bytes = 0, lut_bytes = 0;
   };
   const Stats& stats() const { return stats_; }
 
@@ -187,8 +189,14 @@ private:
   // what the pending draws need, uploaded when they run
   std::vector<PendingDraw> pending_;
   std::vector<uint8_t> arena_;      // vertex arrays and indices, byte-addressed
-  std::vector<float> luts_;         // lookup tables, vec2 entries
+  std::unordered_map<uint64_t, uint32_t> arena_known_; // (address << 32 | bytes) -> where it is in the arena
+  std::vector<float> luts_;         // lookup tables, vec2 entries (kept across submits)
+  wgpu::Buffer luts_buffer_;        // them on the GPU (kLutCapacity floats), luts_uploaded_ of them sent
+  size_t luts_uploaded_ = 0;
+  static constexpr size_t kLutCapacity = 1u << 21; // 8 MiB: about 160 sets of tables
+  std::unordered_map<uint64_t, std::pair<std::vector<uint32_t>, uint32_t>> luts_known_; // content -> place
   std::vector<uint8_t> uniforms_;   // vertex shader and draw uniform blocks, 256-aligned
+  uint32_t last_vs_offset_ = UINT32_MAX, last_draw_offset_ = UINT32_MAX; // the last draw's blocks in it
   std::vector<uint32_t> last_light_tables_, last_fog_table_;
   uint32_t last_luts_at_ = UINT32_MAX;
 };

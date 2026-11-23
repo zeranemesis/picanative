@@ -64,7 +64,14 @@ void pn_write_register(pn_engine* e, uint32_t reg, uint32_t value, uint32_t mask
 void pn_run_program(pn_engine* e, const uint32_t* words, uint32_t count) {
   e->renderer->processor().run_program(words, count);
 }
-void pn_print_register_stats(pn_engine* e) { e->renderer->processor().print_register_stats(); }
+void pn_print_register_stats(pn_engine* e) {
+  e->renderer->processor().print_register_stats();
+  const auto& s = e->renderer->stats();
+  if (std::getenv("PN_REG_STATS"))
+    std::fprintf(stderr, "[picanative] encoding: buffers made %.1f s (%.1f MB: vertices %.1f, tables %.1f), draws "
+                 "encoded %.1f s\n", s.submit_buffers, s.submit_bytes / 1e6, s.arena_bytes / 1e6, s.lut_bytes / 1e6,
+                 s.submit_draws);
+}
 void pn_vertex_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, uint32_t count) {
   e->renderer->processor().vertex_uniforms(first, words, count);
 }
@@ -76,7 +83,7 @@ void pn_geometry_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, u
 void pn_texture_times(pn_engine* e, double out[4], uint64_t* calls) {
   const auto& s = e->renderer->stats();
   out[0] = s.tex_writeback, out[1] = s.tex_known, out[2] = s.tex_hash, out[3] = s.tex_decode;
-  calls[0] = s.tex_calls, calls[1] = s.textures_decoded;
+  calls[0] = s.tex_calls, calls[1] = s.textures_decoded, calls[2] = s.flushes, calls[3] = s.passes;
 }
 
 void pn_times(pn_engine* e, double out[7]) {

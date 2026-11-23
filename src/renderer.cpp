@@ -520,7 +520,12 @@ uint32_t Renderer::arena_copy(uint32_t address, uint32_t size) {
   // from a word boundary, so the shader reads whole words; the return is
   // where `address` lands in the arena
   const uint32_t aligned = address & ~3u, lead = address - aligned, total = align_up(size + lead, 4);
+  // the same range copied before in this submit (one vertex array for many draws): that copy again; memory does
+  // not change while the arena fills (a submit's lists run while the CPU waits)
+  auto [known, added] = arena_known_.try_emplace(uint64_t{aligned} << 32 | total, 0u);
+  if (!added) return known->second + lead;
   const uint32_t at = static_cast<uint32_t>(arena_.size());
+  known->second = at;
   arena_.resize(arena_.size() + total, 0);
   if (const uint8_t* bytes = memory_.map(aligned, total)) {
     std::memcpy(arena_.data() + at, bytes, total);
@@ -539,6 +544,12 @@ uint32_t Renderer::lookup_tables(const pica::State& state) {
     return last_luts_at_;
   last_light_tables_.assign(lights_now, lights_now + 24 * 256);
   last_fog_table_.assign(state.fog_table.begin(), state.fog_table.end());
+  // the same tables met before (materials take turns): their place again
+  std::vector<uint32_t> content(last_light_tables_);
+  content.insert(content.end(), last_fog_table_.begin(), last_fog_table_.end());
+  const uint64_t hash = fnv(reinterpret_cast<const uint8_t*>(content.data()), content.size() * 4);
+  if (const auto seen = luts_known_.find(hash); seen != luts_known_.end() && seen->second.first == content)
+    return last_luts_at_ = seen->second.second;
   const std::vector<uint32_t>& lights = last_light_tables_;
   const std::vector<uint32_t>& fog = last_fog_table_;
   const uint32_t at = static_cast<uint32_t>(luts_.size() / 2);
@@ -552,6 +563,7 @@ uint32_t Renderer::lookup_tables(const pica::State& state) {
     luts_.push_back(static_cast<float>(static_cast<int32_t>((w & 0x1FFF) << 19) >> 19) / 2048.0f);
   }
   last_luts_at_ = at;
+  luts_known_[hash] = {std::move(content), at};
   return at;
 }
 
@@ -1017,16 +1029,29 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   }
 
   // the uniform blocks
-  d.vs_offset = static_cast<uint32_t>(uniforms_.size());
-  uniforms_.resize(uniforms_.size() + align_up(kVsUniformsSize, kUniformAlign), 0);
-  uint8_t* vsu = uniforms_.data() + d.vs_offset;
-  for (int i = 0; i < 96; ++i) std::memcpy(vsu + i * 16, state.vs.float_uniforms[i].data(), 16);
-  for (int i = 0; i < 4; ++i) std::memcpy(vsu + 96 * 16 + i * 4, state.vs.int_uniforms[i].data(), 4);
-  const uint32_t bools = state.vs.bool_uniforms;
-  std::memcpy(vsu + 96 * 16 + 16, &bools, 4);
-  d.draw_offset = static_cast<uint32_t>(uniforms_.size());
-  uniforms_.resize(uniforms_.size() + align_up(sizeof du, kUniformAlign), 0);
-  std::memcpy(uniforms_.data() + d.draw_offset, &du, sizeof du);
+  // the uniform blocks; one the same as the last draw's is that one again (consecutive draws often share
+  // all their constants): less to copy and to send
+  {
+    uint8_t vsu[kVsUniformsSize] = {};
+    for (int i = 0; i < 96; ++i) std::memcpy(vsu + i * 16, state.vs.float_uniforms[i].data(), 16);
+    for (int i = 0; i < 4; ++i) std::memcpy(vsu + 96 * 16 + i * 4, state.vs.int_uniforms[i].data(), 4);
+    const uint32_t bools = state.vs.bool_uniforms;
+    std::memcpy(vsu + 96 * 16 + 16, &bools, 4);
+    if (last_vs_offset_ != UINT32_MAX && std::memcmp(uniforms_.data() + last_vs_offset_, vsu, sizeof vsu) == 0) {
+      d.vs_offset = last_vs_offset_;
+    } else {
+      d.vs_offset = last_vs_offset_ = static_cast<uint32_t>(uniforms_.size());
+      uniforms_.resize(uniforms_.size() + align_up(kVsUniformsSize, kUniformAlign), 0);
+      std::memcpy(uniforms_.data() + d.vs_offset, vsu, sizeof vsu);
+    }
+  }
+  if (last_draw_offset_ != UINT32_MAX && std::memcmp(uniforms_.data() + last_draw_offset_, &du, sizeof du) == 0) {
+    d.draw_offset = last_draw_offset_;
+  } else {
+    d.draw_offset = last_draw_offset_ = static_cast<uint32_t>(uniforms_.size());
+    uniforms_.resize(uniforms_.size() + align_up(sizeof du, kUniformAlign), 0);
+    std::memcpy(uniforms_.data() + d.draw_offset, &du, sizeof du);
+  }
 
   d.pipeline = pipeline(config, state.vs);
   if (!d.pipeline) {
@@ -1060,9 +1085,28 @@ void Renderer::submit(const std::vector<Surface*>& back) {
   if (pending_.empty() && back.empty()) return;
   ++stats_.flushes;
   auto encode_start = std::chrono::steady_clock::now();
-  const wgpu::Buffer arena = make_buffer(gpu_, arena_.data(), arena_.size(), wgpu::BufferUsage::Storage);
-  const wgpu::Buffer luts = make_buffer(gpu_, luts_.data(), luts_.size() * 4, wgpu::BufferUsage::Storage);
-  const wgpu::Buffer uniforms = make_buffer(gpu_, uniforms_.data(), uniforms_.size(), wgpu::BufferUsage::Uniform);
+  // the lookup tables stay on the GPU from one submit to the next: sent again only when some were added
+  const size_t added_luts = luts_.size() - std::min(luts_uploaded_, luts_.size());
+  stats_.submit_bytes += arena_.size() + added_luts * 4 + uniforms_.size();
+  stats_.arena_bytes += arena_.size(), stats_.lut_bytes += added_luts * 4;
+  wgpu::Buffer arena, luts, uniforms;
+  {
+    Timed t{stats_.submit_buffers};
+    arena = make_buffer(gpu_, arena_.data(), arena_.size(), wgpu::BufferUsage::Storage);
+    if (!luts_buffer_) {
+      wgpu::BufferDescriptor bd{};
+      bd.size = kLutCapacity * 4;
+      bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+      luts_buffer_ = gpu_.device.CreateBuffer(&bd);
+      luts_uploaded_ = 0;
+    }
+    if (added_luts)
+      gpu_.queue.WriteBuffer(luts_buffer_, luts_uploaded_ * 4, luts_.data() + luts_uploaded_, added_luts * 4);
+    luts_uploaded_ = luts_.size();
+    luts = luts_buffer_;
+    uniforms = make_buffer(gpu_, uniforms_.data(), uniforms_.size(), wgpu::BufferUsage::Uniform);
+  }
+  const auto draws_start = std::chrono::steady_clock::now();
   const wgpu::CommandEncoder encoder = gpu_.device.CreateCommandEncoder();
 
   wgpu::RenderPassEncoder pass;
@@ -1117,10 +1161,12 @@ void Renderer::submit(const std::vector<Surface*>& back) {
     buffers = gpu_.device.CreateBindGroup(&bd);
   };
 
+  const PendingDraw* last = nullptr; // the last draw encoded in the current pass
   for (const PendingDraw& d : pending_) {
     if (d.clear) {
       // a fill over the whole surface, done on the GPU
-      end_pass();
+      stats_.submit_draws += std::chrono::duration<double>(std::chrono::steady_clock::now() - draws_start).count();
+  end_pass();
       wgpu::RenderPassColorAttachment ca{};
       wgpu::RenderPassDepthStencilAttachment da{};
       wgpu::RenderPassDescriptor rp{};
@@ -1164,17 +1210,30 @@ void Renderer::submit(const std::vector<Surface*>& back) {
       end_pass();
       continue;
     }
-    if (!pass || pass_depth_only || pass_color != d.color || pass_depth != d.depth) begin_pass(d.color, d.depth);
-    const uint32_t offsets[2] = {d.vs_offset, d.draw_offset};
-    pass.SetPipeline(d.pipeline);
+    if (!pass || pass_depth_only || pass_color != d.color || pass_depth != d.depth) {
+      begin_pass(d.color, d.depth);
+      last = nullptr; // a new pass has no state yet
+    }
+    // what changed since the last draw of this pass, and only that (Dawn checks every call)
+    if (!last || last->pipeline.Get() != d.pipeline.Get()) pass.SetPipeline(d.pipeline);
     if (!buffers) make_buffers();
-    pass.SetBindGroup(0, buffers, 2, offsets);
-    pass.SetBindGroup(1, texture_group(d.views, d.samplers));
-    pass.SetScissorRect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
-    pass.SetStencilReference(d.stencil_reference);
-    const wgpu::Color constant{d.blend_constant[0], d.blend_constant[1], d.blend_constant[2], d.blend_constant[3]};
-    pass.SetBlendConstant(&constant);
+    if (!last || last->vs_offset != d.vs_offset || last->draw_offset != d.draw_offset) {
+      const uint32_t offsets[2] = {d.vs_offset, d.draw_offset};
+      pass.SetBindGroup(0, buffers, 2, offsets);
+    }
+    bool same_textures = last != nullptr;
+    for (int u = 0; u < 3 && same_textures; ++u)
+      same_textures = last->views[u].Get() == d.views[u].Get() && last->samplers[u].Get() == d.samplers[u].Get();
+    if (!same_textures) pass.SetBindGroup(1, texture_group(d.views, d.samplers));
+    if (!last || std::memcmp(last->scissor, d.scissor, sizeof d.scissor))
+      pass.SetScissorRect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
+    if (!last || last->stencil_reference != d.stencil_reference) pass.SetStencilReference(d.stencil_reference);
+    if (!last || std::memcmp(last->blend_constant, d.blend_constant, sizeof d.blend_constant)) {
+      const wgpu::Color constant{d.blend_constant[0], d.blend_constant[1], d.blend_constant[2], d.blend_constant[3]};
+      pass.SetBlendConstant(&constant);
+    }
     pass.Draw(d.vertex_count);
+    last = &d;
   }
   end_pass();
 
@@ -1234,9 +1293,13 @@ void Renderer::submit(const std::vector<Surface*>& back) {
 
   pending_.clear();
   arena_.clear();
-  luts_.clear();
+  // the tables are kept (and their place, last_luts_at_) unless they grew large
+  // full: start over (the tables are added again as draws need them)
+  if (luts_.size() + 2 * (24 * 256 + 128) > kLutCapacity)
+    luts_.clear(), luts_known_.clear(), luts_uploaded_ = 0, last_luts_at_ = UINT32_MAX;
   uniforms_.clear();
-  last_luts_at_ = UINT32_MAX;
+  last_vs_offset_ = last_draw_offset_ = UINT32_MAX;
+  arena_known_.clear();
 }
 
 void Renderer::write_back(uint32_t address, uint32_t size, bool forget) {
