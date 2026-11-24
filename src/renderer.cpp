@@ -645,7 +645,7 @@ wgpu::Sampler Renderer::sampler(uint32_t config) {
   sd.minFilter = filter(key >> 2 & 1);
   sd.mipmapFilter = key >> 24 & 1 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
   // PN_ANISOTROPY=n: textures the game filters linearly read along their slope, n samples at most
-  static const int anisotropy = std::getenv("PN_ANISOTROPY") ? std::atoi(std::getenv("PN_ANISOTROPY")) : 0;
+  const int anisotropy = draw::texture_anisotropy;
   if (anisotropy > 1 && (key >> 2 & 1)) {
     sd.magFilter = sd.minFilter = wgpu::FilterMode::Linear;
     sd.mipmapFilter = wgpu::MipmapFilterMode::Linear;
@@ -710,7 +710,7 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   const uint32_t tz = std::min<uint32_t>(std::countr_zero(width), std::countr_zero(height));
   const uint32_t levels = 1 + std::min(largest, tz >= 3 ? tz - 3 : 0);
   // PN_MIPMAPS=1: a texture with no smaller levels that the game filters linearly gets them, averaged here
-  static const bool mipmaps = std::getenv("PN_MIPMAPS") != nullptr;
+  const bool mipmaps = draw::texture_mipmaps;
   const uint32_t made = mipmaps && levels == 1 && (config >> 2 & 1) && std::has_single_bit(width) &&
                                 std::has_single_bit(height) && std::min(width, height) >= 16
                             ? 1 + std::countr_zero(std::min(width, height)) - 2 // down to 4 texels
@@ -1589,6 +1589,14 @@ void Renderer::write_back(uint32_t address, uint32_t size, bool forget) {
   }
   // nothing drawn there: the pending work can wait
   if (!back.empty()) submit(back);
+}
+
+// the texture improvements changed during a game: samplers and textures made again as they are next used (their
+// pipelines too, anisotropy being part of a pipeline's recipe)
+void Renderer::set_texture_options(int anisotropy, bool mipmaps) {
+  if (anisotropy == draw::texture_anisotropy && mipmaps == draw::texture_mipmaps) return;
+  draw::texture_anisotropy = anisotropy, draw::texture_mipmaps = mipmaps;
+  samplers_.clear(), texture_groups_.clear(), known_.clear(), previous_.clear(), textures_.clear();
 }
 
 void Renderer::forget_textures(uint32_t address, uint32_t size) {

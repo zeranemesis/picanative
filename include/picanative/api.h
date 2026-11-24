@@ -82,6 +82,10 @@ PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* 
    is the console's pixels exactly); before the first command list. Memory
    always gets the console's pixels; the window shows the scaled pictures. */
 PN_API void pn_set_resolution_scale(pn_engine* engine, uint32_t scale);
+/* the texture improvements, off by default (PN_ANISOTROPY, PN_MIPMAPS set them at the start): anisotropic
+   filtering up to that many samples (0 or 1: off), smaller levels made for textures with none. Between frames,
+   during a game: the textures are decoded again and the pipelines made again as they are used */
+PN_API void pn_set_texture_options(pn_engine* engine, int anisotropy, int mipmaps);
 
 /* Vertex programs translated ahead of time (by pn_shaders, from the game's
    shader binaries): loaded before the first command list, they are not

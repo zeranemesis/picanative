@@ -21,6 +21,8 @@
 // viewport. The depth is written by the fragment stage, from z/w
 // interpolated linearly as the PICA does, rounded to 24 bits.
 namespace picanative::draw {
+int texture_anisotropy = std::getenv("PN_ANISOTROPY") ? std::atoi(std::getenv("PN_ANISOTROPY")) : 0;
+bool texture_mipmaps = std::getenv("PN_MIPMAPS") != nullptr;
 namespace {
 
 std::string u(uint32_t value) { return std::to_string(value) + "u"; }
@@ -405,11 +407,7 @@ Config configure(const pica::State& state, const vertex::Layout& layout, bool in
   c.upside_down = (r[0x11E] >> 24 & 1) == 0;
 
   c.textures = r[0x080] & 7;
-  static const uint32_t anisotropy = [] {
-    const char* e = std::getenv("PN_ANISOTROPY");
-    return e && std::atoi(e) > 1 ? static_cast<uint32_t>(std::min(std::atoi(e), 16)) : 0u;
-  }();
-  c.anisotropy = anisotropy;
+  c.anisotropy = texture_anisotropy > 1 ? static_cast<uint32_t>(std::min(texture_anisotropy, 16)) : 0u;
   c.texture0_projected = (r[0x083] >> 28 & 7) == 3;
   c.texture2_coord1 = r[0x080] >> 13 & 1;
   static const uint32_t stages[6] = {0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8};

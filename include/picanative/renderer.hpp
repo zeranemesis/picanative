@@ -75,6 +75,7 @@ public:
     if (surfaces_.empty()) scale_ = std::max(1u, std::min(scale, 8u));
   }
   uint32_t scale() const { return scale_; }
+  void set_texture_options(int anisotropy, bool mipmaps);
   gpu::Context& gpu() { return gpu_; }
 
   struct Stats {
