@@ -104,8 +104,9 @@ void pn_print_stats(pn_engine* e) {
               (unsigned long long)s.pipelines_warmed, (unsigned long long)s.textures_from_buffers,
               (unsigned long long)s.rtt_seen[0], (unsigned long long)s.rtt_seen[1], (unsigned long long)s.rtt_seen[2],
               (unsigned long long)s.rtt_seen[3], (unsigned long long)s.rtt_seen[4], (unsigned long long)s.stores_merged);
-  std::printf("[picanative] tiled transfers on the GPU %llu; depth buffers read as color on the GPU %llu\n",
-              (unsigned long long)s.gpu_tiled_transfers, (unsigned long long)s.textures_from_depth);
+  std::printf("[picanative] tiled transfers on the GPU %llu; depth buffers read as color on the GPU %llu; textures from "
+              "a pack %llu\n", (unsigned long long)s.gpu_tiled_transfers, (unsigned long long)s.textures_from_depth,
+              (unsigned long long)s.textures_replaced);
   std::fflush(stdout);
 }
 

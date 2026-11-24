@@ -655,6 +655,42 @@ wgpu::Sampler Renderer::sampler(uint32_t config) {
   return slot;
 }
 
+namespace {
+// textures as files (uncompressed 32-bit TGA: any editor reads and writes it), named by content: a pack of
+// replacements made from a dump works from one run to the next, wherever the game puts its textures
+void write_tga(const std::string& path, uint32_t w, uint32_t h, const uint8_t* rgba) {
+  std::ofstream out(path, std::ios::binary);
+  uint8_t header[18] = {};
+  header[2] = 2, header[12] = w & 0xFF, header[13] = w >> 8, header[14] = h & 0xFF, header[15] = h >> 8;
+  header[16] = 32, header[17] = 0x28; // top-left origin, 8 bits of alpha
+  out.write(reinterpret_cast<const char*>(header), 18);
+  std::vector<uint8_t> bgra(size_t{w} * h * 4);
+  for (size_t i = 0; i < size_t{w} * h; ++i)
+    bgra[i * 4] = rgba[i * 4 + 2], bgra[i * 4 + 1] = rgba[i * 4 + 1], bgra[i * 4 + 2] = rgba[i * 4], bgra[i * 4 + 3] = rgba[i * 4 + 3];
+  out.write(reinterpret_cast<const char*>(bgra.data()), static_cast<std::streamsize>(bgra.size()));
+}
+bool read_tga(const std::string& path, uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba) {
+  std::ifstream in(path, std::ios::binary);
+  uint8_t header[18];
+  if (!in.read(reinterpret_cast<char*>(header), 18) || header[2] != 2 || (header[16] != 32 && header[16] != 24)) return false;
+  w = header[12] | header[13] << 8, h = header[14] | header[15] << 8;
+  const uint32_t bpp = header[16] / 8;
+  if (!w || !h || w > 8192 || h > 8192) return false;
+  in.seekg(18 + header[0]);
+  std::vector<uint8_t> raw(size_t{w} * h * bpp);
+  if (!in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()))) return false;
+  rgba.resize(size_t{w} * h * 4);
+  const bool top_down = header[17] & 0x20;
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint8_t* p = &raw[(size_t{top_down ? y : h - 1 - y} * w + x) * bpp];
+      uint8_t* o = &rgba[(size_t{y} * w + x) * 4];
+      o[0] = p[2], o[1] = p[1], o[2] = p[0], o[3] = bpp == 4 ? p[3] : 0xFF;
+    }
+  return true;
+}
+} // namespace
+
 wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t size[4], float border[4],
                                     float lod[4]) {
   Timed timed{stats_.textures};
@@ -756,6 +792,47 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   if (slot) known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
   if (slot) return slot->view;
   Timed decoding{stats_.tex_decode};
+  // PN_TEXTURE_DUMP=folder: each texture with no smaller levels saved as <content>.tga; PN_TEXTURE_PACK=folder:
+  // one of the same name there taken in its place, at its own size (an HD pack; improvements, both off)
+  static const char* dump_dir = std::getenv("PN_TEXTURE_DUMP");
+  static const char* pack_dir = std::getenv("PN_TEXTURE_PACK");
+  if ((dump_dir || pack_dir) && levels == 1) {
+    const uint32_t shape[2] = {format, width | height << 16};
+    const uint64_t content = fnv(reinterpret_cast<const uint8_t*>(shape), sizeof shape, fnv(data, bytes));
+    char name[40];
+    std::snprintf(name, sizeof name, "%016llx.tga", static_cast<unsigned long long>(content));
+    if (pack_dir) {
+      uint32_t w = 0, h = 0;
+      std::vector<uint8_t> rgba;
+      if (read_tga(std::string(pack_dir) + "/" + name, w, h, rgba)) {
+        slot = std::make_unique<Texture>();
+        wgpu::TextureDescriptor td{};
+        td.size = {w, h, 1};
+        td.format = wgpu::TextureFormat::RGBA8Unorm;
+        td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+        slot->texture = gpu_.device.CreateTexture(&td);
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = slot->texture;
+        wgpu::TexelCopyBufferLayout layout{};
+        layout.bytesPerRow = w * 4;
+        layout.rowsPerImage = h;
+        wgpu::Extent3D extent{w, h, 1};
+        gpu_.queue.WriteTexture(&dst, rgba.data(), rgba.size(), &layout, &extent);
+        slot->view = slot->texture.CreateView();
+        ++stats_.textures_replaced;
+        known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
+        return slot->view;
+      }
+    }
+    if (dump_dir) {
+      const std::string path = std::string(dump_dir) + "/" + name;
+      if (!std::ifstream(path)) {
+        std::vector<uint8_t> rgba;
+        texture::decode(format, data, bytes, width, height, rgba);
+        write_tga(path, width, height, rgba.data());
+      }
+    }
+  }
   // a large texture the game changes in part (an atlas it streams tiles into): the rows of 8x8 tiles that
   // changed, decoded and sent alone, into the same GPU texture (once the work using its old content is sent)
   const auto place = std::tuple{address, format, width | height << 16, levels};

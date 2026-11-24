@@ -91,6 +91,7 @@ public:
     double submit_buffers = 0, submit_draws = 0; // of encoding: the buffers made, the draws encoded
     uint64_t submit_bytes = 0, arena_bytes = 0, lut_bytes = 0;
     uint64_t pipelines_warmed = 0;
+    uint64_t textures_replaced = 0; // from a pack (PN_TEXTURE_PACK)
     uint64_t gpu_tiled_transfers = 0;
     uint64_t textures_from_depth = 0; // depth buffers read as color textures, converted on the GPU // tiled to tiled transfers done on the GPU, into a color buffer
     uint64_t textures_from_buffers = 0, rtt_seen[5] = {}; // render to texture, read from the GPU (seen: by format) // made again at the start from the game's earlier runs
