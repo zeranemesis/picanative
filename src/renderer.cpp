@@ -241,6 +241,10 @@ struct Renderer::Surface {
   wgpu::Texture texture;
   bool loaded = false; // holds what memory had, in this command list
   bool drawn = false;  // drawn into since, to write back
+  // memory as it was when drawing began: the console's GPU writes at once, this one when the range is read; bytes the
+  // game changed meanwhile (the buffer freed and given to other data) are its own, the write-back leaves them
+  std::vector<uint8_t> before;
+  bool pending = false; // told to on_pending
 };
 
 struct Renderer::Texture {
@@ -483,11 +487,32 @@ void Renderer::load(Surface& s) {
   pending_.push_back(upload);
 }
 
-// back to memory, tiled, as the PICA leaves its buffers
+void Renderer::remember(Surface& s) {
+  const uint8_t* bytes = memory_.map(s.address, s.bytes());
+  if (bytes) s.before.assign(bytes, bytes + s.bytes());
+  else s.before.clear();
+  if (on_pending && !s.pending) s.pending = true, on_pending(s.address, s.bytes(), true);
+}
+
+// back to memory, tiled, as the PICA leaves its buffers; bytes the game wrote since drawing began kept (remember)
 void Renderer::store(Surface& s, const std::vector<uint8_t>& data) {
   Timed timed{stats_.store};
-  uint8_t* bytes = memory_.map(s.address, s.bytes());
-  if (!bytes) return;
+  uint8_t* memory = memory_.map(s.address, s.bytes());
+  if (!memory) return;
+  const size_t size = s.bytes();
+  const bool changed = s.before.size() == size && std::memcmp(memory, s.before.data(), size) != 0;
+  std::vector<uint8_t> merged;
+  if (changed) merged.assign(memory, memory + size), ++stats_.stores_merged;
+  uint8_t* bytes = changed ? merged.data() : memory;
+  struct Merge { // on leaving: the stored pixels into memory where the game left it alone
+    Surface& s; uint8_t* memory; const std::vector<uint8_t>& merged; bool changed;
+    ~Merge() {
+      if (changed)
+        for (size_t i = 0; i < merged.size(); ++i)
+          if (memory[i] == s.before[i]) memory[i] = merged[i];
+      s.before.clear();
+    }
+  } merge{s, memory, merged, changed};
   // the readback is at the scale: one sample per block, its top left
   const uint32_t n = scale_, row = align_up(s.width * n * 4, 256);
   if (!s.depth) {
@@ -1065,8 +1090,8 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   Surface& depth = surface(depth_address, width, height, true, depth_format);
   load(color);
   load(depth);
-  if (!color.drawn) forget_textures(color.address, color.bytes());
-  if (!depth.drawn) forget_textures(depth.address, depth.bytes());
+  if (!color.drawn) forget_textures(color.address, color.bytes()), remember(color);
+  if (!depth.drawn) forget_textures(depth.address, depth.bytes()), remember(depth);
   color.drawn = depth.drawn = true;
   d.color = &color;
   d.depth = &depth;
@@ -1289,6 +1314,7 @@ void Renderer::submit(const std::vector<Surface*>& back) {
     store(*rb.surface, std::vector<uint8_t>(bytes, bytes + rb.size));
     rb.buffer.Unmap();
     rb.surface->drawn = false;
+    if (rb.surface->pending && on_pending) rb.surface->pending = false, on_pending(rb.surface->address, rb.surface->bytes(), false);
   }
 
   pending_.clear();
@@ -1368,6 +1394,7 @@ void Renderer::memory_fill(uint32_t start, uint32_t end, uint32_t value, uint32_
         for (int k = 0; k < 4; ++k) clear.clear_color[k] = c[k] / 255.0;
       }
       pending_.push_back(clear);
+      if (!s->drawn) remember(*s);
       s->loaded = s->drawn = true;
       forget_textures(start, end - start);
       return;
@@ -1513,9 +1540,13 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
     scaled = copy.CreateView();
   }
   pictures_.push_back({output, bytes, out, scaled, flip});
+  std::vector<uint8_t> before;
+  if (const uint8_t* now = memory_.map(output, bytes)) before.assign(now, now + bytes);
   deliveries_.push_back({output, bytes, back,
                          back.MapAsync(wgpu::MapMode::Read, 0, bd.size, wgpu::CallbackMode::WaitAnyOnly,
-                                       [](wgpu::MapAsyncStatus, wgpu::StringView) {})});
+                                       [](wgpu::MapAsyncStatus, wgpu::StringView) {}),
+                         std::move(before)});
+  if (on_pending) on_pending(output, bytes, true);
   // shortcut: a host that never reads its pictures back keeps up to 16 on the way
   if (deliveries_.size() > 16) deliver(deliveries_.front().address, 1);
   return true;
@@ -1546,13 +1577,22 @@ void Renderer::deliver(uint32_t address, uint32_t size) {
     Timed waited{stats_.wait};
     gpu_.instance.WaitAny(d.mapped, UINT64_MAX);
     if (const auto* bytes = static_cast<const uint8_t*>(d.buffer.GetConstMappedRange(0, (d.size + 3) & ~3u))) {
-      if (uint8_t* to = memory_.map(d.address, d.size)) std::memcpy(to, bytes, d.size);
-      else
+      if (uint8_t* to = memory_.map(d.address, d.size)) {
+        // the console's engine wrote when the transfer ran: what the game wrote there since is newer, kept
+        if (d.before.size() != d.size || std::memcmp(to, d.before.data(), d.size) == 0) std::memcpy(to, bytes, d.size);
+        else {
+          ++stats_.stores_merged;
+          for (uint32_t k = 0; k < d.size; ++k)
+            if (to[k] == d.before[k]) to[k] = bytes[k];
+        }
+      } else
         for (uint32_t k = 0; k < d.size; ++k)
           if (uint8_t* b = memory_.map(d.address + k, 1)) *b = bytes[k];
     }
     d.buffer.Unmap();
+    const uint32_t done_address = d.address, done_size = d.size;
     deliveries_.erase(deliveries_.begin() + static_cast<std::ptrdiff_t>(i));
+    if (on_pending) on_pending(done_address, done_size, false);
   }
 }
 

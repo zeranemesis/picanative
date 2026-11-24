@@ -43,6 +43,10 @@ PN_API void pn_texture_copy(pn_engine* engine, uint32_t input, uint32_t output, 
    CPU wrote is what the GPU reads next */
 PN_API void pn_sync_for_cpu(pn_engine* engine, uint32_t address, uint32_t size);
 PN_API void pn_cpu_wrote(pn_engine* engine, uint32_t address, uint32_t size);
+/* memory drawn into on the GPU and not in memory yet (pending 1), then written there (0): the console's GPU writes
+   at once, so a host that sees the CPU write there first calls pn_cpu_wrote (with surfaces cached) */
+typedef void (*pn_pending_fn)(void* user, uint32_t address, uint32_t size, int pending);
+PN_API void pn_set_pending_hook(pn_engine* engine, pn_pending_fn hook, void* user);
 
 /* a host that does a game's graphics library natively puts marks in the game's command lists in place of the
    commands the library made (register 0x2F0, which the PICA200 has not): each one met calls this, in the list's

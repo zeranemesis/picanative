@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <memory>
@@ -37,6 +38,9 @@ namespace picanative {
 class Renderer {
 public:
   Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces = false, bool trust_cpu_writes = false);
+  // memory the GPU has drawn into and not yet written (pending true), then written (false): a host that can watch
+  // the CPU's writes there calls cpu_wrote first, as the console's GPU would have written already
+  std::function<void(uint32_t address, uint32_t size, bool pending)> on_pending;
   ~Renderer();
 
   // Runs a command list and its draws.
@@ -86,6 +90,7 @@ public:
     uint64_t tex_calls = 0, textures_updated = 0; // updated: in part, in place
     double submit_buffers = 0, submit_draws = 0; // of encoding: the buffers made, the draws encoded
     uint64_t submit_bytes = 0, arena_bytes = 0, lut_bytes = 0;
+    uint64_t stores_merged = 0; // write-backs over bytes the game had changed since (kept)
   };
   const Stats& stats() const { return stats_; }
 
@@ -126,6 +131,7 @@ private:
   Surface& surface(uint32_t address, uint32_t width, uint32_t height, bool depth, uint32_t format = 0);
   void load(Surface& surface);
   void store(Surface& surface, const std::vector<uint8_t>& data);
+  void remember(Surface& surface); // memory under a surface as drawing into it begins
   wgpu::TextureView texture(const pica::State& state, int unit, uint32_t uniforms[4], float border[4], float lod[4]);
   wgpu::Sampler sampler(uint32_t config);
   wgpu::BindGroup texture_group(const wgpu::TextureView views[3], const wgpu::Sampler samplers[3]);
@@ -156,6 +162,7 @@ private:
     uint32_t address, size;
     wgpu::Buffer buffer;
     wgpu::Future mapped;
+    std::vector<uint8_t> before; // memory when the transfer ran: bytes the game changed since are left to it
   };
   std::vector<Delivery> deliveries_;
   struct Picture {

@@ -53,6 +53,11 @@ void pn_texture_copy(pn_engine* e, uint32_t input, uint32_t output, uint32_t siz
 void pn_sync_for_cpu(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->sync(address, size); }
 void pn_cpu_wrote(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->before_cpu_write(address, size); }
 
+void pn_set_pending_hook(pn_engine* e, pn_pending_fn hook, void* user) {
+  if (hook) e->renderer->on_pending = [hook, user](uint32_t address, uint32_t size, bool pending) { hook(user, address, size, pending); };
+  else e->renderer->on_pending = nullptr;
+}
+
 void pn_set_native_operations(pn_engine* e, pn_native_fn run, void* user) {
   if (run) e->renderer->processor().on_native = [run, user](uint32_t operation) { run(user, operation); };
   else e->renderer->processor().on_native = nullptr;
