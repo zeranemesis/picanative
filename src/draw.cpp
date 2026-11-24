@@ -4,6 +4,8 @@
 
 #include <cmath>
 #include <sstream>
+#include <algorithm>
+#include <cstdlib>
 
 // Bindings of a draw pipeline (group 0):
 //   0: PicaVsUniforms (uniform, dynamic offset)   1: Draw (uniform, dynamic offset)
@@ -341,18 +343,24 @@ std::string lighting_function(const Config& c) {
 // A texture unit's lookup: the sampler bound with it wraps and filters (see
 // Renderer::sampler); the border color and the level of detail are the
 // shader's. Rows are stored top down, so t runs the other way.
-std::string texture_functions(int unit) {
+std::string texture_functions(int unit, bool anisotropic) {
   const std::string n = std::to_string(unit);
   std::ostringstream w;
-  w << "fn sample" << n << "(uv: vec2f, rate: f32) -> vec4f {\n"
+  w << "fn sample" << n << "(uv: vec2f, rate: f32, gx: vec2f, gy: vec2f) -> vec4f {\n"
     << "  let size = dr.texture_size[" << n << "];\n"
     << "  let st = vec2f(uv.x, 1.0 - uv.y);\n"
     << "  let ws = (size.w >> 12u) & 7u;\n  let wt = (size.w >> 8u) & 7u;\n"
     << "  if ((border(ws) && (st.x < 0.0 || st.x >= 1.0)) || (border(wt) && (st.y < 0.0 || st.y >= 1.0))) { return "
        "dr.texture_border["
     << n << "]; }\n"
-    << "  var level = 0.0;\n"
-    << "  if (size.z > 1u) {\n"
+    << "  var level = 0.0;\n";
+  // anisotropic: along the slope of the coordinates (the game's level bias as a scale of it; its clamps left
+  // to the sampler), for textures with levels the game filters linearly
+  if (anisotropic)
+    w << "  if (size.z > 1u && (size.w & 4u) != 0u) {\n"
+      << "    let bias = exp2(dr.texture_lod[" << n << "].x);\n"
+      << "    return textureSampleGrad(tex" << n << ", smp" << n << ", st, gx * bias, gy * bias);\n  }\n";
+  w << "  if (size.z > 1u) {\n"
     << "    let lod = dr.texture_lod[" << n << "];\n"
     << "    let l = clamp(rate + lod.x, lod.y, lod.z);\n"
     << "    level = select(0.0, l, l > 0.0);\n  }\n"
@@ -369,7 +377,7 @@ std::vector<uint32_t> Config::key() const {
   k.push_back(loader_count);
   k.insert(k.end(), loader_fields, loader_fields + 12);
   for (const Field& field : fields) k.insert(k.end(), {field.offset, field.type, field.count, field.input});
-  k.insert(k.end(), {topology, indexed, upside_down, textures, texture0_projected, texture2_coord1});
+  k.insert(k.end(), {topology, indexed, upside_down, textures, texture0_projected, texture2_coord1, anisotropy});
   for (int s = 0; s < 6; ++s) k.insert(k.end(), {tev[s][0], tev[s][1], tev[s][2], tev_scale[s]});
   k.insert(k.end(), {buffer_update, alpha_test, fog, fog_flip, lighting, light_count, light_slots, light_config0,
                      light_config1});
@@ -397,6 +405,11 @@ Config configure(const pica::State& state, const vertex::Layout& layout, bool in
   c.upside_down = (r[0x11E] >> 24 & 1) == 0;
 
   c.textures = r[0x080] & 7;
+  static const uint32_t anisotropy = [] {
+    const char* e = std::getenv("PN_ANISOTROPY");
+    return e && std::atoi(e) > 1 ? static_cast<uint32_t>(std::min(std::atoi(e), 16)) : 0u;
+  }();
+  c.anisotropy = anisotropy;
   c.texture0_projected = (r[0x083] >> 28 & 7) == 3;
   c.texture2_coord1 = r[0x080] >> 13 & 1;
   static const uint32_t stages[6] = {0x0C0, 0x0C8, 0x0D0, 0x0D8, 0x0F0, 0x0F8};
@@ -573,7 +586,7 @@ std::string fragment_wgsl(const Config& c) {
        "    case 2u: { return a == b; }\n    case 3u: { return a != b; }\n    case 4u: { return a < b; }\n"
        "    case 5u: { return a <= b; }\n    case 6u: { return a > b; }\n    default: { return a >= b; }\n  }\n}\n";
   for (int unit = 0; unit < 3; ++unit)
-    if (c.textures >> unit & 1) w << texture_functions(unit);
+    if (c.textures >> unit & 1) w << texture_functions(unit, c.anisotropy != 0);
   if (c.lighting) w << lighting_function(c);
   w << "struct FOut {\n  @location(0) color: vec4f,\n  @builtin(frag_depth) depth: f32,\n}\n";
   w << "@fragment fn fs(inp: VOut) -> FOut {\n";
@@ -594,7 +607,9 @@ std::string fragment_wgsl(const Config& c) {
   }
   for (int unit = 0; unit < 3; ++unit)
     if (c.textures >> unit & 1)
-      w << "  t" << unit << " = sample" << unit << "(uv" << unit << ", rate" << unit << ");\n";
+      // the slope in the texture's [0, 1] (t runs down: its sign flips)
+      w << "  t" << unit << " = sample" << unit << "(uv" << unit << ", rate" << unit << ", vec2f(1.0, -1.0) * dpdx(uv"
+        << unit << "), vec2f(1.0, -1.0) * dpdy(uv" << unit << "));\n";
   if (c.lighting) {
     w << "  let lit = shade(inp.quaternion, inp.view, t0, t1, t2, t3);\n";
     w << "  let lit_primary = lit[0];\n  let lit_secondary = lit[1];\n";

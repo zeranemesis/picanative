@@ -32,6 +32,7 @@ struct Config {
   bool upside_down = false;
   // fragment stage
   uint32_t textures = 0;                   // bits 0-2: units on
+  uint32_t anisotropy = 0;                 // PN_ANISOTROPY (an improvement, off: 0): textures read along their slope
   bool texture0_projected = false;
   bool texture2_coord1 = false;
   uint32_t tev[6][3] = {};                 // per stage: sources, operands, combiner (+ scale in tev_scale)

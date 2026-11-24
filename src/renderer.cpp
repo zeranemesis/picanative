@@ -644,6 +644,13 @@ wgpu::Sampler Renderer::sampler(uint32_t config) {
   sd.magFilter = filter(key >> 1 & 1);
   sd.minFilter = filter(key >> 2 & 1);
   sd.mipmapFilter = key >> 24 & 1 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
+  // PN_ANISOTROPY=n: textures the game filters linearly read along their slope, n samples at most
+  static const int anisotropy = std::getenv("PN_ANISOTROPY") ? std::atoi(std::getenv("PN_ANISOTROPY")) : 0;
+  if (anisotropy > 1 && (key >> 2 & 1)) {
+    sd.magFilter = sd.minFilter = wgpu::FilterMode::Linear;
+    sd.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+    sd.maxAnisotropy = static_cast<uint16_t>(std::min(anisotropy, 16));
+  }
   slot = gpu_.device.CreateSampler(&sd);
   return slot;
 }
@@ -666,10 +673,16 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   const uint32_t largest = lod_reg >> 16 & 0xF;
   const uint32_t tz = std::min<uint32_t>(std::countr_zero(width), std::countr_zero(height));
   const uint32_t levels = 1 + std::min(largest, tz >= 3 ? tz - 3 : 0);
-  size[0] = width, size[1] = height, size[2] = levels, size[3] = config;
-  const uint32_t max = std::min(largest, levels - 1);
+  // PN_MIPMAPS=1: a texture with no smaller levels that the game filters linearly gets them, averaged here
+  static const bool mipmaps = std::getenv("PN_MIPMAPS") != nullptr;
+  const uint32_t made = mipmaps && levels == 1 && (config >> 2 & 1) && std::has_single_bit(width) &&
+                                std::has_single_bit(height) && std::min(width, height) >= 16
+                            ? 1 + std::countr_zero(std::min(width, height)) - 2 // down to 4 texels
+                            : 0;
+  size[0] = width, size[1] = height, size[2] = made ? made : levels, size[3] = config;
+  const uint32_t max = made ? made - 1 : std::min(largest, levels - 1);
   lod[0] = static_cast<float>(static_cast<int32_t>(lod_reg << 19) >> 19) / 256.0f;
-  lod[1] = static_cast<float>(std::min(lod_reg >> 24 & 0xF, max));
+  lod[1] = made ? 0.0f : static_cast<float>(std::min(lod_reg >> 24 & 0xF, max));
   lod[2] = static_cast<float>(max);
   lod[3] = static_cast<float>((config >> 2 & 1) | (config >> 24 & 1) << 1);
 
@@ -802,17 +815,30 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   }
   wgpu::TextureDescriptor td{};
   td.size = {width, height, 1};
-  td.mipLevelCount = levels;
+  td.mipLevelCount = made ? made : levels;
   td.format = wgpu::TextureFormat::RGBA8Unorm;
   td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
   slot->texture = gpu_.device.CreateTexture(&td);
   std::vector<uint8_t> rgba;
   uint32_t at = 0;
-  for (uint32_t l = 0; l < levels; ++l) {
+  for (uint32_t l = 0; l < td.mipLevelCount; ++l) {
     const uint32_t w = std::max(width >> l, 1u), h = std::max(height >> l, 1u);
-    const uint32_t level_bytes = texture::size(format, w, h);
-    texture::decode(format, data + at, level_bytes, w, h, rgba);
-    at += level_bytes;
+    if (l < levels) {
+      const uint32_t level_bytes = texture::size(format, w, h);
+      texture::decode(format, data + at, level_bytes, w, h, rgba);
+      at += level_bytes;
+    } else { // a made level: each texel the average of the four above it
+      std::vector<uint8_t> half(size_t{w} * h * 4);
+      const uint32_t pw = w * 2;
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+          for (uint32_t k = 0; k < 4; ++k) {
+            const auto px = [&](uint32_t xx, uint32_t yy) { return uint32_t{rgba[(size_t{yy} * pw + xx) * 4 + k]}; };
+            half[(size_t{y} * w + x) * 4 + k] =
+                static_cast<uint8_t>((px(2 * x, 2 * y) + px(2 * x + 1, 2 * y) + px(2 * x, 2 * y + 1) + px(2 * x + 1, 2 * y + 1) + 2) / 4);
+          }
+      rgba.swap(half);
+    }
     wgpu::TexelCopyTextureInfo dst{};
     dst.texture = slot->texture;
     dst.mipLevel = l;
