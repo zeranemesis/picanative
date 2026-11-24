@@ -33,6 +33,7 @@ pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, 
 void pn_destroy(pn_engine* engine) { delete engine; }
 
 void pn_set_resolution_scale(pn_engine* e, uint32_t scale) { e->renderer->set_scale(scale); }
+void pn_set_texture_options(pn_engine* e, int anisotropy, int mipmaps) { e->renderer->set_texture_options(anisotropy, mipmaps != 0); }
 
 void pn_command_list(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->command_list(address, size); }
 

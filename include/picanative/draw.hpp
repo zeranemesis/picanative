@@ -88,4 +88,9 @@ struct alignas(16) DrawUniforms {
   float lights[8][9][4];       // specular0, specular1, diffuse, ambient, position, direction, spot, distance(bias, scale), number
 };
 
+// the texture improvements (off by default), from PN_ANISOTROPY and PN_MIPMAPS; Renderer::set_texture_options
+// changes them during a game
+extern int texture_anisotropy;
+extern bool texture_mipmaps;
+
 } // namespace picanative::draw
