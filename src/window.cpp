@@ -81,6 +81,14 @@ fn pixel(xi: i32, yi: i32) -> vec3f {
   }
 }
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+// the scanlines: a dark line on the last window pixels of each of the console's 240 rows, one pixel wide (a fifth
+// of a row at least, half at most), its edge smoothed at sizes between whole multiples. Not sin(fract(row) * pi),
+// symmetric: at 2x both pixels of a row took the same value, no line seen
+fn scanline(rows: f32) -> f32 {
+  let fw = max(fwidth(rows), 1e-4);
+  let width = clamp(fw, 0.2, 0.5);
+  return 1.0 - 0.35 * clamp((fract(rows) - (1.0 - width)) / fw + 0.5, 0.0, 1.0);
+}
 // p.w: the effects, as the picture's shader has them (none by default: the pixels as they are)
 @fragment fn fs(v: V) -> @location(0) vec4f {
   let fx = v.uv.x * f32(p.x);
@@ -104,7 +112,7 @@ fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
   if ((e & 4u) != 0u) {
     c = clamp(mat3x3f(0.86, 0.07, 0.04, 0.10, 0.86, 0.09, 0.04, 0.07, 0.87) * pow(c, vec3f(1.12)), vec3f(0.0), vec3f(1.0));
   }
-  if ((e & 8u) != 0u) { c = c * (0.78 + 0.22 * sin(fract(fy) * 3.14159265)); }
+  if ((e & 8u) != 0u) { c = c * scanline(fy); }
   return vec4f(c, 1.0);
 }
 )";
@@ -132,6 +140,14 @@ struct V { @builtin(position) position: vec4f, @location(0) uv: vec2f, }
 // colors, 8 scanlines); all 0 by default: the picture as it was
 fn at(t: vec2f) -> vec3f { return textureSampleLevel(picture, linear_sampler, t, 0.0).rgb; }
 fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+// the scanlines: a dark line on the last window pixels of each of the console's 240 rows, one pixel wide (a fifth
+// of a row at least, half at most), its edge smoothed at sizes between whole multiples. Not sin(fract(row) * pi),
+// symmetric: at 2x both pixels of a row took the same value, no line seen
+fn scanline(rows: f32) -> f32 {
+  let fw = max(fwidth(rows), 1e-4);
+  let width = clamp(fw, 0.2, 0.5);
+  return 1.0 - 0.35 * clamp((fract(rows) - (1.0 - width)) / fw + 0.5, 0.0, 1.0);
+}
 @fragment fn fs(v: V) -> @location(0) vec4f {
   let t = vec2f(1.0 - v.uv.y, select(v.uv.x, 1.0 - v.uv.x, p.x != 0u));
   let size = vec2f(textureDimensions(picture));
@@ -161,8 +177,7 @@ fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
     c = clamp(mat3x3f(0.86, 0.07, 0.04, 0.10, 0.86, 0.09, 0.04, 0.07, 0.87) * g, vec3f(0.0), vec3f(1.0));
   }
   if ((p.z & 8u) != 0u) { // lines between the screen's rows (an LCD row is a texel column of the picture)
-    let row = fract(texel.x);
-    c = c * (0.78 + 0.22 * sin(row * 3.14159265));
+    c = c * scanline(t.x * 240.0); // the console's rows, whatever the picture's resolution scale
   }
   return vec4f(c, 1.0);
 }
