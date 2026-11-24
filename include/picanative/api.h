@@ -115,6 +115,7 @@ typedef struct pn_window pn_window;
    the bytes from one column to the next (0: 240 pixels' worth) */
 typedef struct pn_screen {
   uint32_t address, format, stride;
+  uint32_t right; /* the right eye's framebuffer, when the game draws one (3D): 0 or the same otherwise */
 } pn_screen;
 
 /* the buttons as the console's HID reports them */
@@ -173,6 +174,9 @@ PN_API void pn_window_set_filter(pn_window* window, uint32_t filter, uint32_t ef
    pn_window_shot as a PPM picture, to check the screens' look with no window on the screen */
 PN_API pn_window* pn_offscreen_open(pn_engine* engine, uint32_t scale);
 PN_API int pn_window_shot(pn_window* window, const pn_screen screens[2], const char* path);
+/* the top screen in 3D, when the game draws both eyes: 0 off (the left eye, as before), 1 anaglyph red and cyan,
+   2 side by side (each eye half as wide, for 3D televisions and headsets) */
+PN_API void pn_window_set_stereo(pn_window* window, int mode);
 /* the inputs the last pn_window_poll read, for code that reads them on its
    own (a game's platform layer finding this export at run time); 0 before
    any window polled */

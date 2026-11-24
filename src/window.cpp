@@ -180,8 +180,8 @@ struct pn_window {
   wgpu::PresentMode mode = wgpu::PresentMode::Fifo;
   wgpu::RenderPipeline pipeline, picture_pipeline;
   wgpu::Sampler smooth;
-  wgpu::Buffer upload[2];
-  uint32_t upload_size[2] = {};
+  wgpu::Buffer upload[4]; // per screen, and the top's right eye
+  uint32_t upload_size[4] = {};
   SDL_Gamepad* gamepad = nullptr;
   SDL_AudioStream* audio = nullptr;
   bool touching = false;
@@ -193,6 +193,8 @@ struct pn_window {
   // screen has no size
   int layout = PN_LAYOUT_STACKED;
   uint32_t filter = 0, effects = 0; // pn_window_set_filter
+  int stereo = 0;                    // pn_window_set_stereo
+  wgpu::RenderPipeline picture_masked[2], memory_masked[2]; // red alone, green and blue: an anaglyph's eyes
   struct Rect {
     float x, y, w, h;
   };
@@ -373,6 +375,11 @@ void make_pipelines(pn_window* w) {
   pd.vertex.entryPoint = "vs";
   pd.fragment = &fs;
   w->pipeline = g.device.CreateRenderPipeline(&pd);
+  target.writeMask = wgpu::ColorWriteMask::Red;
+  w->memory_masked[0] = g.device.CreateRenderPipeline(&pd);
+  target.writeMask = wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+  w->memory_masked[1] = g.device.CreateRenderPipeline(&pd);
+  target.writeMask = wgpu::ColorWriteMask::All;
   {
     wgpu::ShaderSourceWGSL picture_wgsl{};
     picture_wgsl.code = kPictureWgsl;
@@ -382,6 +389,11 @@ void make_pipelines(pn_window* w) {
     fs.module = picture_module;
     pd.vertex.module = picture_module;
     w->picture_pipeline = g.device.CreateRenderPipeline(&pd);
+    target.writeMask = wgpu::ColorWriteMask::Red;
+    w->picture_masked[0] = g.device.CreateRenderPipeline(&pd);
+    target.writeMask = wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+    w->picture_masked[1] = g.device.CreateRenderPipeline(&pd);
+    target.writeMask = wgpu::ColorWriteMask::All;
     wgpu::SamplerDescriptor sd{};
     sd.magFilter = sd.minFilter = wgpu::FilterMode::Linear;
     w->smooth = g.device.CreateSampler(&sd);
@@ -463,9 +475,15 @@ static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Textur
   gpu::Context& g = w->engine->gpu;
   Renderer& renderer = *w->engine->renderer;
   // one screen into a pass, at a place in its target
-  auto draw = [&](const wgpu::RenderPassEncoder& pass, int i, const pn_window::Rect& place) {
+  // mask: 0 all colors, 1 red alone, 2 green and blue (an anaglyph's eyes); right: the right eye's picture
+  auto draw = [&](const wgpu::RenderPassEncoder& pass, int i, const pn_window::Rect& place, int mask = 0,
+                  bool right = false) {
     if (place.w <= 0) return; // hidden in this layout
-    const pn_screen& s = screens[i];
+    pn_screen s = screens[i];
+    if (right) s.address = s.right;
+    const int slot = i + (right ? 2 : 0); // its own upload buffer: both eyes go in one pass
+    const wgpu::RenderPipeline& picture_pipeline = mask ? w->picture_masked[mask - 1] : w->picture_pipeline;
+    const wgpu::RenderPipeline& memory_pipeline = mask ? w->memory_masked[mask - 1] : w->pipeline;
     const uint32_t lcd_width = i == 0 ? 400 : 320;
     const uint32_t format = s.format & 7, bpp = format == 0 ? 4 : format == 1 ? 3 : 2;
     const uint32_t stride = s.stride ? s.stride : 240 * bpp, bytes = stride * lcd_width;
@@ -484,10 +502,10 @@ static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Textur
       e[1].binding = 1, e[1].sampler = w->smooth;
       e[2].binding = 2, e[2].buffer = uniform, e[2].size = sizeof parameters;
       wgpu::BindGroupDescriptor bd{};
-      bd.layout = w->picture_pipeline.GetBindGroupLayout(0);
+      bd.layout = picture_pipeline.GetBindGroupLayout(0);
       bd.entryCount = 3;
       bd.entries = e;
-      pass.SetPipeline(w->picture_pipeline);
+      pass.SetPipeline(picture_pipeline);
       pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
       pass.SetViewport(place.x, place.y, place.w, place.h, 0, 1);
       pass.Draw(3);
@@ -498,20 +516,20 @@ static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Textur
     if (!source) {
       renderer.sync(s.address, bytes);
       const uint32_t padded = (bytes + 3) & ~3u;
-      if (w->upload_size[i] < padded) {
+      if (w->upload_size[slot] < padded) {
         wgpu::BufferDescriptor bd{};
         bd.size = padded;
         bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
-        w->upload[i] = g.device.CreateBuffer(&bd);
-        w->upload_size[i] = padded;
+        w->upload[slot] = g.device.CreateBuffer(&bd);
+        w->upload_size[slot] = padded;
       }
       std::vector<uint8_t> copy(padded, 0);
       if (const uint8_t* from = w->engine->memory.map(s.address, bytes)) std::memcpy(copy.data(), from, bytes);
       else
         for (uint32_t k = 0; k < bytes; ++k)
           if (const uint8_t* b = w->engine->memory.map(s.address + k, 1)) copy[k] = *b;
-      g.queue.WriteBuffer(w->upload[i], 0, copy.data(), padded);
-      source = w->upload[i];
+      g.queue.WriteBuffer(w->upload[slot], 0, copy.data(), padded);
+      source = w->upload[slot];
     }
     const uint32_t parameters[4] = {lcd_width, stride, format, w->effects};
     wgpu::BufferDescriptor ud{};
@@ -523,10 +541,10 @@ static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Textur
     e[0].binding = 0, e[0].buffer = source, e[0].size = (bytes + 3) & ~3u;
     e[1].binding = 1, e[1].buffer = uniform, e[1].size = sizeof parameters;
     wgpu::BindGroupDescriptor bd{};
-    bd.layout = w->pipeline.GetBindGroupLayout(0);
+    bd.layout = memory_pipeline.GetBindGroupLayout(0);
     bd.entryCount = 2;
     bd.entries = e;
-    pass.SetPipeline(w->pipeline);
+    pass.SetPipeline(memory_pipeline);
     pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
     pass.SetViewport(place.x, place.y, place.w, place.h, 0, 1);
     pass.Draw(3);
@@ -573,7 +591,20 @@ static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Textur
   frame_pass(*target, [&](const wgpu::RenderPassEncoder& pass) {
     pn_window::Rect places[2];
     w->screens(places);
-    for (int i = 0; i < 2; ++i) draw(pass, i, places[i]);
+    for (int i = 0; i < 2; ++i) {
+      // 3D: the top screen's two eyes, when the game draws them
+      if (i == 0 && w->stereo && screens[0].right && screens[0].right != screens[0].address) {
+        if (w->stereo == 1) {
+          draw(pass, 0, places[0], 1, false), draw(pass, 0, places[0], 2, true);
+        } else {
+          pn_window::Rect left = places[0], right = places[0];
+          left.w /= 2, right.w /= 2, right.x += left.w;
+          draw(pass, 0, left, 0, false), draw(pass, 0, right, 0, true);
+        }
+        continue;
+      }
+      draw(pass, i, places[i]);
+    }
   });
 }
 
@@ -789,6 +820,8 @@ void pn_window_audio(pn_window* w, const int16_t* samples, uint32_t frames) {
 }
 
 void pn_window_title(pn_window* w, const char* title) { SDL_SetWindowTitle(w->window, title); }
+
+void pn_window_set_stereo(pn_window* w, int mode) { w->stereo = std::clamp(mode, 0, 2); }
 
 void pn_window_set_filter(pn_window* w, uint32_t filter, uint32_t effects) {
   w->filter = std::min(filter, 2u);
