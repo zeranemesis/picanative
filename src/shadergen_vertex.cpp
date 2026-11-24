@@ -347,22 +347,85 @@ std::string name_uniforms(std::string out, const std::string& uniforms) {
 // the exact translation, for any flow
 std::string state_machine(const pica::ShaderUnit& unit, const std::string& uniforms, std::ostringstream& w);
 
+// The addresses control can reach from the entry point, as the hardware runs
+// blocks: a call, if or loop block from its start to its end (then back to
+// the instruction after it), a jump anywhere, the end instruction stopping.
+struct Reach {
+  const std::array<uint32_t, pica::kProgramSize>& program;
+  std::array<bool, pica::kProgramSize> reached{};
+  std::set<std::pair<uint32_t, uint32_t>> walked;
+  int steps = 0;
+  bool lost = false; // flow it cannot follow (going backwards): everything counts
+
+  void walk(uint32_t from, uint32_t to) {
+    if (lost || !walked.insert({from, to}).second) return;
+    for (uint32_t pc = from; pc < to && pc < pica::kProgramSize;) {
+      if (++steps > 1 << 16) {
+        lost = true;
+        return;
+      }
+      reached[pc] = true;
+      const uint32_t word = program[pc], op = opcode(word), dest = target(word), n = count(word);
+      if (op == End) return;
+      uint32_t next = pc + 1;
+      switch (op) {
+      case Call: case CallC: case CallU: walk(dest, dest + n); break;
+      case IfC: case IfU: walk(pc + 1, dest), walk(dest, dest + n), next = dest + n; break;
+      case Loop: walk(pc + 1, dest + 1), next = dest + 1; break;
+      case JmpC: case JmpU: walk(dest, dest < to ? to : pica::kProgramSize); break; // past its block's end: no return
+      default: break;
+      }
+      if (next <= pc) {
+        lost = true;
+        return;
+      }
+      if (next > to) to = pica::kProgramSize; // stepped over its block's end: it never returns
+      pc = next;
+    }
+  }
+};
+
 } // namespace
+
+pica::ShaderUnit reachable(const pica::ShaderUnit& unit) {
+  Reach r{unit.program};
+  r.walk(unit.entry_point, pica::kProgramSize);
+  pica::ShaderUnit out;
+  out.entry_point = unit.entry_point;
+  if (r.lost) { // shortcut: the whole unit for flow the walk gives up on; such a program is never found ahead
+    out.program = unit.program;
+    out.descriptors = unit.descriptors;
+    return out;
+  }
+  for (uint32_t pc = 0; pc < pica::kProgramSize; ++pc) {
+    if (!r.reached[pc]) continue;
+    const uint32_t word = unit.program[pc], op = opcode(word);
+    out.program[pc] = word;
+    if (flow(op)) continue;
+    const uint32_t d = (op == kMad || op == kMadI ? word & 0x1F : word & 0x7F) % pica::kDescriptorSize;
+    out.descriptors[d] = unit.descriptors[d];
+  }
+  return out;
+}
 
 uint64_t program_key(const pica::ShaderUnit& unit) {
   if (!unit.key_stale) return unit.key;
+  const pica::ShaderUnit used = reachable(unit);
   uint64_t hash = 0xCBF29CE484222325ull;
   auto add = [&hash](uint32_t word) {
     for (int b = 0; b < 4; ++b) hash = (hash ^ (word >> (8 * b) & 0xFF)) * 0x100000001B3ull;
   };
-  for (uint32_t word : unit.program) add(word);
-  for (uint32_t word : unit.descriptors) add(word);
-  add(unit.entry_point);
+  for (uint32_t word : used.program) add(word);
+  for (uint32_t word : used.descriptors) add(word);
+  add(used.entry_point);
   unit.key = hash, unit.key_stale = false;
   return hash;
 }
 
-std::string vertex_function(const pica::ShaderUnit& unit, const std::string& uniforms) {
+const char* const kVersion = __DATE__ " " __TIME__;
+
+std::string vertex_function(const pica::ShaderUnit& given, const std::string& uniforms, bool whole) {
+  const pica::ShaderUnit unit = whole ? given : reachable(given);
   std::ostringstream w;
   w << "fn cu(i: i32) -> vec4f { if (i < 0 || i >= 96) { return vec4f(0.0); } return " << uniforms
     << ".c[i]; }\n" << kHelpers;

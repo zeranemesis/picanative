@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <ctime>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -53,29 +56,56 @@ struct V { @builtin(position) position: vec4f, @location(0) uv: vec2f, }
 }
 fn byte(at: u32) -> u32 { return (fb[at >> 2u] >> ((at & 3u) * 8u)) & 0xFFu; }
 fn five(c: u32) -> f32 { return f32((c << 3u) | (c >> 2u)) / 255.0; }
-@fragment fn fs(v: V) -> @location(0) vec4f {
-  let x = min(u32(v.uv.x * f32(p.x)), p.x - 1u);
-  let y = min(u32(v.uv.y * 240.0), 239u);
-  let format = p.z;
+fn pixel(xi: i32, yi: i32) -> vec3f {
+  let x = u32(clamp(xi, 0, i32(p.x) - 1));
+  let y = u32(clamp(yi, 0, 239));
+  let format = p.z & 7u;
   let bpp = select(2u, select(3u, 4u, format == 0u), format <= 1u);
   let at = x * p.y + (239u - y) * bpp;
   switch format {
-    case 0u: { return vec4f(f32(byte(at + 3u)), f32(byte(at + 2u)), f32(byte(at + 1u)), 255.0) / 255.0; }
-    case 1u: { return vec4f(f32(byte(at + 2u)), f32(byte(at + 1u)), f32(byte(at)), 255.0) / 255.0; }
+    case 0u: { return vec3f(f32(byte(at + 3u)), f32(byte(at + 2u)), f32(byte(at + 1u))) / 255.0; }
+    case 1u: { return vec3f(f32(byte(at + 2u)), f32(byte(at + 1u)), f32(byte(at))) / 255.0; }
     case 2u: {
       let c = byte(at) | (byte(at + 1u) << 8u);
       let g = (c >> 5u) & 63u;
-      return vec4f(five(c >> 11u), f32((g << 2u) | (g >> 4u)) / 255.0, five(c & 31u), 1.0);
+      return vec3f(five(c >> 11u), f32((g << 2u) | (g >> 4u)) / 255.0, five(c & 31u));
     }
     case 3u: {
       let c = byte(at) | (byte(at + 1u) << 8u);
-      return vec4f(five(c >> 11u), five((c >> 6u) & 31u), five((c >> 1u) & 31u), 1.0);
+      return vec3f(five(c >> 11u), five((c >> 6u) & 31u), five((c >> 1u) & 31u));
     }
     default: {
       let c = byte(at) | (byte(at + 1u) << 8u);
-      return vec4f(f32(c >> 12u), f32((c >> 8u) & 15u), f32((c >> 4u) & 15u), 15.0) / 15.0;
+      return vec3f(f32(c >> 12u), f32((c >> 8u) & 15u), f32((c >> 4u) & 15u)) / 15.0;
     }
   }
+}
+fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
+// p.w: the effects, as the picture's shader has them (none by default: the pixels as they are)
+@fragment fn fs(v: V) -> @location(0) vec4f {
+  let fx = v.uv.x * f32(p.x);
+  let fy = v.uv.y * 240.0;
+  let x = i32(min(u32(fx), p.x - 1u));
+  let y = i32(min(u32(fy), 239u));
+  var c = pixel(x, y);
+  let e = p.w;
+  if ((e & 3u) != 0u) {
+    let n = pixel(x, y - 1); let s = pixel(x, y + 1); let r = pixel(x + 1, y); let l = pixel(x - 1, y);
+    if ((e & 1u) != 0u) {
+      let ln = luma(n); let ls = luma(s); let lr = luma(r); let ll = luma(l); let lc = luma(c);
+      let range = max(max(max(ln, ls), max(lr, ll)), lc) - min(min(min(ln, ls), min(lr, ll)), lc);
+      if (range > max(0.0312, 0.125 * max(lc, max(max(ln, ls), max(lr, ll))))) {
+        let along_x = abs(ln + ls - 2.0 * lc) >= abs(lr + ll - 2.0 * lc);
+        c = mix(c, select((r + l) * 0.5, (n + s) * 0.5, along_x), clamp(range * 2.0, 0.0, 0.5));
+      }
+    }
+    if ((e & 2u) != 0u) { c = clamp(c * 1.6 - (n + s + r + l) * 0.15, vec3f(0.0), vec3f(1.0)); }
+  }
+  if ((e & 4u) != 0u) {
+    c = clamp(mat3x3f(0.86, 0.07, 0.04, 0.10, 0.86, 0.09, 0.04, 0.07, 0.87) * pow(c, vec3f(1.12)), vec3f(0.0), vec3f(1.0));
+  }
+  if ((e & 8u) != 0u) { c = c * (0.78 + 0.22 * sin(fract(fy) * 3.14159265)); }
+  return vec4f(c, 1.0);
 }
 )";
 
@@ -98,9 +128,43 @@ struct V { @builtin(position) position: vec4f, @location(0) uv: vec2f, }
   v.uv = uv;
   return v;
 }
+// p.y: the filter (0 bilinear, 1 nearest, 2 sharp bilinear); p.z: effects (1 FXAA, 2 sharpen, 4 the 3DS LCD's
+// colors, 8 scanlines); all 0 by default: the picture as it was
+fn at(t: vec2f) -> vec3f { return textureSampleLevel(picture, linear_sampler, t, 0.0).rgb; }
+fn luma(c: vec3f) -> f32 { return dot(c, vec3f(0.299, 0.587, 0.114)); }
 @fragment fn fs(v: V) -> @location(0) vec4f {
   let t = vec2f(1.0 - v.uv.y, select(v.uv.x, 1.0 - v.uv.x, p.x != 0u));
-  return vec4f(textureSampleLevel(picture, linear_sampler, t, 0.0).rgb, 1.0);
+  let size = vec2f(textureDimensions(picture));
+  let texel = t * size;
+  let fw = max(fwidth(texel), vec2f(1e-5));
+  var uv = t;
+  if (p.y == 1u) { uv = (floor(texel) + 0.5) / size; }
+  if (p.y == 2u) { uv = (floor(texel) + 0.5 + clamp((fract(texel) - 0.5) / fw, vec2f(-0.5), vec2f(0.5))) / size; }
+  var c = at(uv);
+  let d = 1.0 / size;
+  if ((p.z & 3u) != 0u) {
+    let n = at(uv + vec2f(0.0, -d.y)); let s = at(uv + vec2f(0.0, d.y));
+    let e = at(uv + vec2f(d.x, 0.0)); let w = at(uv + vec2f(-d.x, 0.0));
+    if ((p.z & 1u) != 0u) { // FXAA, its light form: where the contrast is an edge, blend across it
+      let ln = luma(n); let ls = luma(s); let le = luma(e); let lw = luma(w); let lc = luma(c);
+      let range = max(max(max(ln, ls), max(le, lw)), lc) - min(min(min(ln, ls), min(le, lw)), lc);
+      if (range > max(0.0312, 0.125 * max(lc, max(max(ln, ls), max(le, lw))))) {
+        let along_x = abs(ln + ls - 2.0 * lc) >= abs(le + lw - 2.0 * lc);
+        let blend = select((e + w) * 0.5, (n + s) * 0.5, along_x);
+        c = mix(c, blend, clamp(range * 2.0, 0.0, 0.5));
+      }
+    }
+    if ((p.z & 2u) != 0u) { c = clamp(c * 1.6 - (n + s + e + w) * 0.15, vec3f(0.0), vec3f(1.0)); }
+  }
+  if ((p.z & 4u) != 0u) { // as the console's screen shows it: a little darker, its colors bleeding a little
+    let g = pow(c, vec3f(1.12));
+    c = clamp(mat3x3f(0.86, 0.07, 0.04, 0.10, 0.86, 0.09, 0.04, 0.07, 0.87) * g, vec3f(0.0), vec3f(1.0));
+  }
+  if ((p.z & 8u) != 0u) { // lines between the screen's rows (an LCD row is a texel column of the picture)
+    let row = fract(texel.x);
+    c = c * (0.78 + 0.22 * sin(row * 3.14159265));
+  }
+  return vec4f(c, 1.0);
 }
 )";
 
@@ -118,8 +182,8 @@ struct pn_window {
   wgpu::PresentMode mode = wgpu::PresentMode::Fifo;
   wgpu::RenderPipeline pipeline, picture_pipeline;
   wgpu::Sampler smooth;
-  wgpu::Buffer upload[2];
-  uint32_t upload_size[2] = {};
+  wgpu::Buffer upload[4]; // per screen, and the top's right eye
+  uint32_t upload_size[4] = {};
   SDL_Gamepad* gamepad = nullptr;
   SDL_AudioStream* audio = nullptr;
   bool touching = false;
@@ -130,6 +194,10 @@ struct pn_window {
   // the console's pixels), as large as the window allows, centred; a hidden
   // screen has no size
   int layout = PN_LAYOUT_STACKED;
+  uint32_t filter = 0, effects = 0; // pn_window_set_filter
+  int stereo = 0;                    // pn_window_set_stereo
+  bool shot_asked = false;           // F12
+  wgpu::RenderPipeline picture_masked[2], memory_masked[2]; // red alone, green and blue: an anaglyph's eyes
   struct Rect {
     float x, y, w, h;
   };
@@ -289,30 +357,10 @@ struct pn_window {
   }
 };
 
-extern "C" {
-
-pn_window* pn_window_open(pn_engine* engine, const char* title, uint32_t scale, char* error, uint32_t error_size) {
-  auto fail = [&](const std::string& message) -> pn_window* {
-    if (error && error_size) std::snprintf(error, error_size, "%s", message.c_str());
-    return nullptr;
-  };
-  if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) return fail(SDL_GetError());
-  auto w = new pn_window;
-  w->engine = engine;
-  scale = std::max(scale, 1u);
-  w->window = SDL_CreateWindow(title, kWidth * static_cast<int>(scale), kHeight * static_cast<int>(scale),
-                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-  if (!w->window) {
-    delete w;
-    return fail(SDL_GetError());
-  }
-  gpu::Context& g = engine->gpu;
-  if (!w->attach()) {
-    SDL_DestroyWindow(w->window);
-    delete w;
-    return fail("the GPU cannot draw into this window");
-  }
-
+namespace {
+// the pipelines that draw the screens, for the window's format (or a picture's)
+void make_pipelines(pn_window* w) {
+  gpu::Context& g = w->engine->gpu;
   wgpu::ShaderSourceWGSL wgsl{};
   wgsl.code = kPresentWgsl;
   wgpu::ShaderModuleDescriptor md{};
@@ -330,6 +378,11 @@ pn_window* pn_window_open(pn_engine* engine, const char* title, uint32_t scale, 
   pd.vertex.entryPoint = "vs";
   pd.fragment = &fs;
   w->pipeline = g.device.CreateRenderPipeline(&pd);
+  target.writeMask = wgpu::ColorWriteMask::Red;
+  w->memory_masked[0] = g.device.CreateRenderPipeline(&pd);
+  target.writeMask = wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+  w->memory_masked[1] = g.device.CreateRenderPipeline(&pd);
+  target.writeMask = wgpu::ColorWriteMask::All;
   {
     wgpu::ShaderSourceWGSL picture_wgsl{};
     picture_wgsl.code = kPictureWgsl;
@@ -339,10 +392,48 @@ pn_window* pn_window_open(pn_engine* engine, const char* title, uint32_t scale, 
     fs.module = picture_module;
     pd.vertex.module = picture_module;
     w->picture_pipeline = g.device.CreateRenderPipeline(&pd);
+    target.writeMask = wgpu::ColorWriteMask::Red;
+    w->picture_masked[0] = g.device.CreateRenderPipeline(&pd);
+    target.writeMask = wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue;
+    w->picture_masked[1] = g.device.CreateRenderPipeline(&pd);
+    target.writeMask = wgpu::ColorWriteMask::All;
     wgpu::SamplerDescriptor sd{};
     sd.magFilter = sd.minFilter = wgpu::FilterMode::Linear;
     w->smooth = g.device.CreateSampler(&sd);
   }
+}
+} // namespace
+
+extern "C" {
+
+pn_window* pn_window_open(pn_engine* engine, const char* title, uint32_t scale, char* error, uint32_t error_size) {
+  auto fail = [&](const std::string& message) -> pn_window* {
+    if (error && error_size) std::snprintf(error, error_size, "%s", message.c_str());
+    return nullptr;
+  };
+  if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_AUDIO)) return fail(SDL_GetError());
+  auto w = new pn_window;
+  w->engine = engine;
+  scale = std::max(scale, 1u);
+  w->window = SDL_CreateWindow(title, kWidth * static_cast<int>(scale), kHeight * static_cast<int>(scale),
+                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+  if (!w->window) {
+    delete w;
+    return fail(SDL_GetError());
+  }
+  // PN_WINDOW_AT=x,y: where the window opens (off the screen, for a test that captures it alone)
+  if (const char* at = std::getenv("PN_WINDOW_AT")) {
+    int x = 0, y = 0;
+    if (std::sscanf(at, "%d,%d", &x, &y) == 2) SDL_SetWindowPosition(w->window, x, y);
+  }
+  gpu::Context& g = engine->gpu;
+  if (!w->attach()) {
+    SDL_DestroyWindow(w->window);
+    delete w;
+    return fail("the GPU cannot draw into this window");
+  }
+
+  make_pipelines(w);
 
   SDL_AudioSpec spec{SDL_AUDIO_S16, 2, kAudioRate};
   w->audio = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
@@ -361,9 +452,10 @@ void pn_window_close(pn_window* w) {
   SDL_Quit();
 }
 
+static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Texture* target);
+int pn_window_shot(pn_window* w, const pn_screen screens[2], const char* path);
+
 void pn_window_present(pn_window* w, const pn_screen screens[2]) {
-  gpu::Context& g = w->engine->gpu;
-  Renderer& renderer = *w->engine->renderer;
   if (!w->surface) return; // in the background (Android): no window to draw into
   wgpu::SurfaceTexture frame;
   w->surface.GetCurrentTexture(&frame);
@@ -378,10 +470,38 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     w->configure(); // resized: the next frame shows
     return;
   }
+  compose(w, screens, &frame.texture);
+  w->surface.Present();
+  // F12: what the window shows, at its size, into PN_SCREENSHOT_DIR (or Pictures/ctrnative), a BMP by the time
+  if (w->shot_asked) {
+    w->shot_asked = false;
+    std::filesystem::path dir;
+    if (const char* d = std::getenv("PN_SCREENSHOT_DIR")) dir = d;
+    else if (const char* home = std::getenv("USERPROFILE")) dir = std::filesystem::path(home) / "Pictures" / "ctrnative";
+    else dir = "screenshots";
+    std::error_code ignored;
+    std::filesystem::create_directories(dir, ignored);
+    char name[64];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(name, sizeof name, "%Y-%m-%d_%H-%M-%S.bmp", std::localtime(&now));
+    pn_window_shot(w, screens, (dir / name).string().c_str());
+  }
+}
+
+// the screens drawn into the window's frame, or into a picture (an offscreen window: no second display)
+static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Texture* target) {
+  gpu::Context& g = w->engine->gpu;
+  Renderer& renderer = *w->engine->renderer;
   // one screen into a pass, at a place in its target
-  auto draw = [&](const wgpu::RenderPassEncoder& pass, int i, const pn_window::Rect& place) {
+  // mask: 0 all colors, 1 red alone, 2 green and blue (an anaglyph's eyes); right: the right eye's picture
+  auto draw = [&](const wgpu::RenderPassEncoder& pass, int i, const pn_window::Rect& place, int mask = 0,
+                  bool right = false) {
     if (place.w <= 0) return; // hidden in this layout
-    const pn_screen& s = screens[i];
+    pn_screen s = screens[i];
+    if (right) s.address = s.right;
+    const int slot = i + (right ? 2 : 0); // its own upload buffer: both eyes go in one pass
+    const wgpu::RenderPipeline& picture_pipeline = mask ? w->picture_masked[mask - 1] : w->picture_pipeline;
+    const wgpu::RenderPipeline& memory_pipeline = mask ? w->memory_masked[mask - 1] : w->pipeline;
     const uint32_t lcd_width = i == 0 ? 400 : 320;
     const uint32_t format = s.format & 7, bpp = format == 0 ? 4 : format == 1 ? 3 : 2;
     const uint32_t stride = s.stride ? s.stride : 240 * bpp, bytes = stride * lcd_width;
@@ -389,7 +509,7 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     // drawn above the console's resolution: that picture, straight
     bool flipped = false;
     if (const wgpu::TextureView picture = renderer.picture_view(s.address, flipped)) {
-      const uint32_t parameters[4] = {flipped ? 1u : 0u, 0, 0, 0};
+      const uint32_t parameters[4] = {flipped ? 1u : 0u, w->filter, w->effects, 0};
       wgpu::BufferDescriptor ud{};
       ud.size = sizeof parameters;
       ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
@@ -400,10 +520,10 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
       e[1].binding = 1, e[1].sampler = w->smooth;
       e[2].binding = 2, e[2].buffer = uniform, e[2].size = sizeof parameters;
       wgpu::BindGroupDescriptor bd{};
-      bd.layout = w->picture_pipeline.GetBindGroupLayout(0);
+      bd.layout = picture_pipeline.GetBindGroupLayout(0);
       bd.entryCount = 3;
       bd.entries = e;
-      pass.SetPipeline(w->picture_pipeline);
+      pass.SetPipeline(picture_pipeline);
       pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
       pass.SetViewport(place.x, place.y, place.w, place.h, 0, 1);
       pass.Draw(3);
@@ -414,22 +534,22 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     if (!source) {
       renderer.sync(s.address, bytes);
       const uint32_t padded = (bytes + 3) & ~3u;
-      if (w->upload_size[i] < padded) {
+      if (w->upload_size[slot] < padded) {
         wgpu::BufferDescriptor bd{};
         bd.size = padded;
         bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
-        w->upload[i] = g.device.CreateBuffer(&bd);
-        w->upload_size[i] = padded;
+        w->upload[slot] = g.device.CreateBuffer(&bd);
+        w->upload_size[slot] = padded;
       }
       std::vector<uint8_t> copy(padded, 0);
       if (const uint8_t* from = w->engine->memory.map(s.address, bytes)) std::memcpy(copy.data(), from, bytes);
       else
         for (uint32_t k = 0; k < bytes; ++k)
           if (const uint8_t* b = w->engine->memory.map(s.address + k, 1)) copy[k] = *b;
-      g.queue.WriteBuffer(w->upload[i], 0, copy.data(), padded);
-      source = w->upload[i];
+      g.queue.WriteBuffer(w->upload[slot], 0, copy.data(), padded);
+      source = w->upload[slot];
     }
-    const uint32_t parameters[4] = {lcd_width, stride, format, 0};
+    const uint32_t parameters[4] = {lcd_width, stride, format, w->effects};
     wgpu::BufferDescriptor ud{};
     ud.size = sizeof parameters;
     ud.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst;
@@ -439,10 +559,10 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
     e[0].binding = 0, e[0].buffer = source, e[0].size = (bytes + 3) & ~3u;
     e[1].binding = 1, e[1].buffer = uniform, e[1].size = sizeof parameters;
     wgpu::BindGroupDescriptor bd{};
-    bd.layout = w->pipeline.GetBindGroupLayout(0);
+    bd.layout = memory_pipeline.GetBindGroupLayout(0);
     bd.entryCount = 2;
     bd.entries = e;
-    pass.SetPipeline(w->pipeline);
+    pass.SetPipeline(memory_pipeline);
     pass.SetBindGroup(0, g.device.CreateBindGroup(&bd));
     pass.SetViewport(place.x, place.y, place.w, place.h, 0, 1);
     pass.Draw(3);
@@ -486,12 +606,99 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
   }
 #endif
 
-  frame_pass(frame.texture, [&](const wgpu::RenderPassEncoder& pass) {
+  frame_pass(*target, [&](const wgpu::RenderPassEncoder& pass) {
     pn_window::Rect places[2];
     w->screens(places);
-    for (int i = 0; i < 2; ++i) draw(pass, i, places[i]);
+    for (int i = 0; i < 2; ++i) {
+      // 3D: the top screen's two eyes, when the game draws them
+      if (i == 0 && w->stereo && screens[0].right && screens[0].right != screens[0].address) {
+        if (w->stereo == 1) {
+          draw(pass, 0, places[0], 1, false), draw(pass, 0, places[0], 2, true);
+        } else {
+          pn_window::Rect left = places[0], right = places[0];
+          left.w /= 2, right.w /= 2, right.x += left.w;
+          draw(pass, 0, left, 0, false), draw(pass, 0, right, 0, true);
+        }
+        continue;
+      }
+      draw(pass, i, places[i]);
+    }
   });
-  w->surface.Present();
+}
+
+pn_window* pn_offscreen_open(pn_engine* engine, uint32_t scale) {
+  auto w = new pn_window;
+  w->engine = engine;
+  w->format = wgpu::TextureFormat::RGBA8Unorm;
+  w->width = 400 * static_cast<int>(std::max(scale, 1u)), w->height = 480 * static_cast<int>(std::max(scale, 1u));
+  make_pipelines(w);
+  return w;
+}
+
+int pn_window_shot(pn_window* w, const pn_screen screens[2], const char* path) {
+  gpu::Context& g = w->engine->gpu;
+  wgpu::TextureDescriptor td{};
+  td.size = {static_cast<uint32_t>(w->width), static_cast<uint32_t>(w->height), 1};
+  td.format = w->format;
+  td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc;
+  const wgpu::Texture picture = g.device.CreateTexture(&td);
+  compose(w, screens, &picture);
+  const uint32_t row = (td.size.width * 4 + 255) & ~255u;
+  wgpu::BufferDescriptor bd{};
+  bd.size = uint64_t{row} * td.size.height;
+  bd.usage = wgpu::BufferUsage::CopyDst | wgpu::BufferUsage::MapRead;
+  const wgpu::Buffer back = g.device.CreateBuffer(&bd);
+  wgpu::TexelCopyTextureInfo from{};
+  from.texture = picture;
+  wgpu::TexelCopyBufferInfo to{};
+  to.buffer = back;
+  to.layout.bytesPerRow = row;
+  to.layout.rowsPerImage = td.size.height;
+  const wgpu::CommandEncoder encoder = g.device.CreateCommandEncoder();
+  encoder.CopyTextureToBuffer(&from, &to, &td.size);
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  g.queue.Submit(1, &commands);
+  bool mapped = false;
+  gpu::wait(g, back.MapAsync(wgpu::MapMode::Read, 0, bd.size, wgpu::CallbackMode::WaitAnyOnly,
+                             [&](wgpu::MapAsyncStatus status, wgpu::StringView) { mapped = status == wgpu::MapAsyncStatus::Success; }));
+  if (!mapped) return 0;
+  const auto* bytes = static_cast<const uint8_t*>(back.GetConstMappedRange(0, bd.size));
+  // the target's order: a window's surface is often BGRA
+  const bool bgra = td.format == wgpu::TextureFormat::BGRA8Unorm || td.format == wgpu::TextureFormat::BGRA8UnormSrgb;
+  const std::string name = path;
+  const bool bmp = name.size() > 4 && (name.substr(name.size() - 4) == ".bmp" || name.substr(name.size() - 4) == ".BMP");
+  std::FILE* f = std::fopen(path, "wb");
+  if (f) {
+    const uint32_t w_px = td.size.width, h_px = td.size.height;
+    if (bmp) {
+      const uint32_t line = (w_px * 3 + 3) & ~3u, data = line * h_px;
+      uint8_t header[54] = {'B', 'M'};
+      auto put = [&](int at, uint32_t v) { for (int k = 0; k < 4; ++k) header[at + k] = static_cast<uint8_t>(v >> (8 * k)); };
+      put(2, 54 + data), put(10, 54), put(14, 40), put(18, w_px), put(22, h_px);
+      header[26] = 1, header[28] = 24;
+      put(34, data);
+      std::fwrite(header, 1, 54, f);
+      std::vector<uint8_t> out(line, 0);
+      for (uint32_t y = h_px; y-- > 0;) { // bottom up
+        for (uint32_t x = 0; x < w_px; ++x) {
+          const uint8_t* p = bytes + size_t{y} * row + x * 4;
+          out[x * 3] = bgra ? p[0] : p[2], out[x * 3 + 1] = p[1], out[x * 3 + 2] = bgra ? p[2] : p[0];
+        }
+        std::fwrite(out.data(), 1, line, f);
+      }
+    } else {
+      std::fprintf(f, "P6\n%u %u\n255\n", w_px, h_px);
+      for (uint32_t y = 0; y < h_px; ++y)
+        for (uint32_t x = 0; x < w_px; ++x) {
+          const uint8_t* p = bytes + size_t{y} * row + x * 4;
+          const uint8_t rgb[3] = {bgra ? p[2] : p[0], p[1], bgra ? p[0] : p[2]};
+          std::fwrite(rgb, 1, 3, f);
+        }
+    }
+    std::fclose(f);
+  }
+  back.Unmap();
+  return f != nullptr;
 }
 
 int pn_window_poll(pn_window* w, pn_input* input) {
@@ -503,8 +710,9 @@ int pn_window_poll(pn_window* w, pn_input* input) {
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED: open = false; break;
     case SDL_EVENT_KEY_DOWN:
       if (event.key.key == SDLK_ESCAPE) open = false;
-      // F10: the next layout; F11 or Alt+Enter: full screen
+      // F10: the next layout; F11 or Alt+Enter: full screen; F12: a screenshot of the window
       if (event.key.key == SDLK_F10 && !event.key.repeat) w->layout = (w->layout + 1) % 4;
+      if (event.key.key == SDLK_F12 && !event.key.repeat) w->shot_asked = true;
       if ((event.key.key == SDLK_F11 || (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT))) &&
           !event.key.repeat) {
         w->fullscreen = !w->fullscreen;
@@ -658,6 +866,13 @@ void pn_window_audio(pn_window* w, const int16_t* samples, uint32_t frames) {
 }
 
 void pn_window_title(pn_window* w, const char* title) { SDL_SetWindowTitle(w->window, title); }
+
+void pn_window_set_stereo(pn_window* w, int mode) { w->stereo = std::clamp(mode, 0, 2); }
+
+void pn_window_set_filter(pn_window* w, uint32_t filter, uint32_t effects) {
+  w->filter = std::min(filter, 2u);
+  w->effects = effects & 15u;
+}
 
 void pn_window_set_layout(pn_window* w, int layout) {
   w->layout = std::clamp(layout, 0, 3);

@@ -53,10 +53,79 @@ void pn_texture_copy(pn_engine* e, uint32_t input, uint32_t output, uint32_t siz
 void pn_sync_for_cpu(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->sync(address, size); }
 void pn_cpu_wrote(pn_engine* e, uint32_t address, uint32_t size) { e->renderer->before_cpu_write(address, size); }
 
+void pn_set_pending_hook(pn_engine* e, pn_pending_fn hook, void* user) {
+  if (hook) e->renderer->on_pending = [hook, user](uint32_t address, uint32_t size, bool pending) { hook(user, address, size, pending); };
+  else e->renderer->on_pending = nullptr;
+}
+
+void pn_set_native_operations(pn_engine* e, pn_native_fn run, void* user) {
+  if (run) e->renderer->processor().on_native = [run, user](uint32_t operation) { run(user, operation); };
+  else e->renderer->processor().on_native = nullptr;
+}
+
+void pn_write_register(pn_engine* e, uint32_t reg, uint32_t value, uint32_t mask) {
+  e->renderer->processor().write(reg, value, mask);
+}
+void pn_run_program(pn_engine* e, const uint32_t* words, uint32_t count) {
+  e->renderer->processor().run_program(words, count);
+}
+void pn_print_register_stats(pn_engine* e) {
+  e->renderer->processor().print_register_stats();
+  const auto& s = e->renderer->stats();
+  if (std::getenv("PN_REG_STATS"))
+    std::fprintf(stderr, "[picanative] encoding: buffers made %.1f s (%.1f MB: vertices %.1f, tables %.1f), draws "
+                 "encoded %.1f s\n", s.submit_buffers, s.submit_bytes / 1e6, s.arena_bytes / 1e6, s.lut_bytes / 1e6,
+                 s.submit_draws);
+}
+void pn_vertex_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, uint32_t count) {
+  e->renderer->processor().vertex_uniforms(first, words, count);
+}
+
+void pn_geometry_uniforms(pn_engine* e, uint32_t first, const uint32_t* words, uint32_t count) {
+  e->renderer->processor().vertex_uniforms(first, words, count, true);
+}
+
+void pn_texture_times(pn_engine* e, double out[4], uint64_t* calls) {
+  const auto& s = e->renderer->stats();
+  out[0] = s.tex_writeback, out[1] = s.tex_known, out[2] = s.tex_hash, out[3] = s.tex_decode;
+  calls[0] = s.tex_calls, calls[1] = s.textures_decoded, calls[2] = s.flushes, calls[3] = s.passes;
+}
+
 void pn_times(pn_engine* e, double out[7]) {
   const auto& s = e->renderer->stats();
   const double times[7] = {s.record, s.textures, s.pipelines_time, s.encode, s.wait, s.store, s.load};
   for (int i = 0; i < 7; ++i) out[i] = times[i];
+}
+
+void pn_print_stats(pn_engine* e) {
+  const auto& s = e->renderer->stats();
+  std::printf("[picanative] pipelines made ahead %llu; textures read from color buffers on the GPU %llu (seen by format "
+              "RGBA8 %llu, RGB8 %llu, RGB5A1 %llu, RGB565 %llu, RGBA4 %llu); write-backs merged %llu\n",
+              (unsigned long long)s.pipelines_warmed, (unsigned long long)s.textures_from_buffers,
+              (unsigned long long)s.rtt_seen[0], (unsigned long long)s.rtt_seen[1], (unsigned long long)s.rtt_seen[2],
+              (unsigned long long)s.rtt_seen[3], (unsigned long long)s.rtt_seen[4], (unsigned long long)s.stores_merged);
+  std::printf("[picanative] tiled transfers on the GPU %llu; depth buffers read as color on the GPU %llu; textures from "
+              "a pack %llu\n", (unsigned long long)s.gpu_tiled_transfers, (unsigned long long)s.textures_from_depth,
+              (unsigned long long)s.textures_replaced);
+  std::fflush(stdout);
+}
+
+uint32_t pn_warm_pipelines(pn_engine* e, const char* path) {
+  return static_cast<uint32_t>(e->renderer->warm_pipelines(path));
+}
+
+int pn_load_shaders(pn_engine* e, const char* path, char* error, uint32_t error_size) {
+  std::string message;
+  if (e->renderer->load_translations(path, message)) return 1;
+  if (error && error_size) std::snprintf(error, error_size, "%s", message.c_str());
+  return 0;
+}
+
+void pn_shader_stats(pn_engine* e, uint64_t out[3]) {
+  const auto& s = e->renderer->stats();
+  out[0] = s.programs_ahead;
+  out[1] = s.programs_translated;
+  out[2] = static_cast<uint64_t>(s.translating * 1e6);
 }
 
 void pn_stats(pn_engine* e, uint64_t out[3]) {

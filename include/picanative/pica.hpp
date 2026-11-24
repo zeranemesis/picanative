@@ -3,6 +3,7 @@
 #include "picanative/memory.hpp"
 
 #include <array>
+#include <map>
 #include <vector>
 #include <cstdint>
 #include <functional>
@@ -26,6 +27,11 @@ inline constexpr uint32_t kRegCmdBufSize0 = 0x238, kRegCmdBufAddr0 = 0x23A, kReg
                           kRegCmdBufJump1 = 0x23D;
 inline constexpr uint32_t kRegVsAttributeCount = 0x242, kRegVsComMode = 0x244;
 inline constexpr uint32_t kRegGsBlock = 0x280, kRegVsBlock = 0x2B0, kShaderBlockSize = 0x2E;
+// not the console's: a register past the shader blocks the PICA200 has nothing at, which a host's own functions
+// write in place of the commands a game's graphics library made: "run native operation n here" (on_native)
+inline constexpr uint32_t kRegNativeOperation = 0x2F0;
+// the same: what follows a mark where the game's block was, skipped unread (its extra words)
+inline constexpr uint32_t kRegNativeSkip = 0x2F1;
 
 // offsets inside a shader unit's block
 inline constexpr uint32_t kShaderBoolUniforms = 0x00, kShaderIntUniforms = 0x01, kShaderIntUniformsEnd = 0x04,
@@ -71,6 +77,8 @@ struct State {
 class CommandProcessor {
 public:
   explicit CommandProcessor(Memory& memory);
+  // PN_REG_STATS set: the words written by register, to stderr
+  void print_register_stats() const;
 
   // Runs the command list at a physical address, following its jumps.
   void run(uint32_t address, uint32_t size);
@@ -85,10 +93,22 @@ public:
   // or the command list ends.
   using Vertex = std::array<Vec4, 16>;
   std::function<void(const State&, const std::vector<Vertex>&)> on_immediate;
+  // a native operation's mark (kRegNativeOperation), in the order the list has it
+  std::function<void(uint32_t operation)> on_native;
   uint64_t draws = 0, immediate_vertices = 0, command_lists = 0;
+  std::array<uint64_t, kRegisterCount> words_by_register{};
+  uint64_t jump_words = 0;
+  std::map<uint32_t, uint64_t> jump_targets;
+  std::map<uint32_t, uint64_t> attribute_lists;
+
+  // for a native operation: a register set as a command would (a draw register draws)
+  void write(uint32_t reg, uint32_t value, uint32_t mask);
+  // vertex (or geometry) shader float uniforms from `first`, each four 32-bit floats as a command list carries them (w first)
+  void vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count, bool geometry = false);
+  // a native operation's program, in one call (pn_run_program's steps)
+  void run_program(const uint32_t* words, size_t count);
 
 private:
-  void write(uint32_t reg, uint32_t value, uint32_t mask);
   void flush_immediate();
   void configure(ShaderUnit& unit, uint32_t offset, uint32_t value);
   void upload_uniform(ShaderUnit& unit, uint32_t word);

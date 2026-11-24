@@ -4,9 +4,11 @@
 #include "picanative/gpu.hpp"
 #include "picanative/memory.hpp"
 #include "picanative/pica.hpp"
+#include "picanative/shadergen.hpp"
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <memory>
@@ -36,6 +38,9 @@ namespace picanative {
 class Renderer {
 public:
   Renderer(gpu::Context& gpu, Memory& memory, bool cache_surfaces = false, bool trust_cpu_writes = false);
+  // memory the GPU has drawn into and not yet written (pending true), then written (false): a host that can watch
+  // the CPU's writes there calls cpu_wrote first, as the console's GPU would have written already
+  std::function<void(uint32_t address, uint32_t size, bool pending)> on_pending;
   ~Renderer();
 
   // Runs a command list and its draws.
@@ -75,8 +80,22 @@ public:
   struct Stats {
     uint64_t draws = 0, skipped = 0, passes = 0, pipelines = 0, textures_decoded = 0, flushes = 0;
     uint64_t shader_errors = 0, vertex_modules = 0, waiting = 0, gpu_transfers = 0; // waiting: draws skipped while their pipeline compiles
+    // vertex programs: translations loaded (load_translations), programs translated while running
+    uint64_t programs_ahead = 0, programs_translated = 0;
+    double translating = 0; // seconds, part of pipelines_time
     // where the time goes, in seconds
     double record = 0, textures = 0, pipelines_time = 0, encode = 0, wait = 0, load = 0, store = 0;
+    // of textures: making memory current (write_back), finding a known one, hashing, decoding; texture() calls
+    double tex_writeback = 0, tex_known = 0, tex_hash = 0, tex_decode = 0;
+    uint64_t tex_calls = 0, textures_updated = 0; // updated: in part, in place
+    double submit_buffers = 0, submit_draws = 0; // of encoding: the buffers made, the draws encoded
+    uint64_t submit_bytes = 0, arena_bytes = 0, lut_bytes = 0;
+    uint64_t pipelines_warmed = 0;
+    uint64_t textures_replaced = 0; // from a pack (PN_TEXTURE_PACK)
+    uint64_t gpu_tiled_transfers = 0;
+    uint64_t textures_from_depth = 0; // depth buffers read as color textures, converted on the GPU // tiled to tiled transfers done on the GPU, into a color buffer
+    uint64_t textures_from_buffers = 0, rtt_seen[5] = {}; // render to texture, read from the GPU (seen: by format) // made again at the start from the game's earlier runs
+    uint64_t stores_merged = 0; // write-backs over bytes the game had changed since (kept)
   };
   const Stats& stats() const { return stats_; }
 
@@ -84,6 +103,14 @@ public:
   // ready yet are skipped (for a game: no stall; tools comparing pictures
   // keep the default, compiling as it goes).
   void set_async_pipelines(bool on) { async_ = on; }
+
+  // Vertex programs translated ahead of time (shadergen::save_translations):
+  // those are not translated again; any other the game runs is, and logged.
+  bool load_translations(const std::string& path, std::string& error);
+  // the pipelines a game made in its earlier runs (their recipes in this file), made again now on Dawn's threads
+  // (from its disk cache: milliseconds each), and the new ones added to the file: a pipeline is never made in the
+  // middle of the game twice. Returns how many were started.
+  size_t warm_pipelines(const std::string& path);
 
   // the first WGSL compile errors, for diagnosis
   std::vector<std::string> errors;
@@ -104,6 +131,11 @@ private:
   void write_back(uint32_t address, uint32_t size, bool forget);
   void forget_textures(uint32_t address, uint32_t size);
   // a display transfer done on the GPU, when its input is a surface it holds
+  bool gpu_tiled_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
+                          uint32_t flags);
+  wgpu::ComputePipeline tiled_pipeline_;
+  wgpu::ComputePipeline depth_color_pipeline_;
+  wgpu::TextureView depth_as_color(Surface& s);
   bool gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
                     uint32_t flags);
   // memory gets the GPU transfers on their way into a range (all of them with
@@ -113,6 +145,7 @@ private:
   Surface& surface(uint32_t address, uint32_t width, uint32_t height, bool depth, uint32_t format = 0);
   void load(Surface& surface);
   void store(Surface& surface, const std::vector<uint8_t>& data);
+  void remember(Surface& surface); // memory under a surface as drawing into it begins
   wgpu::TextureView texture(const pica::State& state, int unit, uint32_t uniforms[4], float border[4], float lod[4]);
   wgpu::Sampler sampler(uint32_t config);
   wgpu::BindGroup texture_group(const wgpu::TextureView views[3], const wgpu::Sampler samplers[3]);
@@ -127,6 +160,17 @@ private:
   uint32_t scale_ = 1;
   std::set<std::string> compiling_;
   std::vector<wgpu::Future> futures_;
+  std::unordered_map<std::string, wgpu::Future> warming_; // pipelines on Dawn's threads, by key
+  // what makes a pipeline, as kept in the recipes' file: its sources and its fixed-function state
+  struct Recipe {
+    std::string id, vertex, fragment;
+    std::vector<uint32_t> state; // cull, front, mask, blending (on, 6), depth (write, compare), stencil (on, 6)
+  };
+  struct Described;
+  wgpu::RenderPipelineDescriptor* describe(const Recipe& recipe, Described& out);
+  void start_pipeline(const Recipe& recipe);
+  std::string recipes_path_;
+  std::set<std::string> recipes_known_;
   pica::CommandProcessor processor_;
   Stats stats_;
 
@@ -143,6 +187,7 @@ private:
     uint32_t address, size;
     wgpu::Buffer buffer;
     wgpu::Future mapped;
+    std::vector<uint8_t> before; // memory when the transfer ran: bytes the game changed since are left to it
   };
   std::vector<Delivery> deliveries_;
   struct Picture {
@@ -155,6 +200,8 @@ private:
   std::unordered_map<uint32_t, wgpu::Sampler> samplers_;
   std::unordered_map<std::string, wgpu::RenderPipeline> pipelines_;
   std::unordered_map<std::string, wgpu::ShaderModule> modules_;
+  shadergen::Translations translations_; // program_key -> vertex_function(.., "vsu")
+  std::set<uint64_t> checked_;           // PN_CHECK_SHADERS
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, bool, uint32_t>, std::unique_ptr<Surface>> surfaces_;
   std::unordered_map<uint64_t, std::unique_ptr<Texture>> textures_;
   // cached mode: the texture each (address, format, size, levels) decoded to,
@@ -164,12 +211,24 @@ private:
     Texture* texture;
   };
   std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, Known> known_;
+  // large textures: their last content and key, to send only what changed next time
+  struct Previous {
+    uint64_t key;
+    std::vector<uint8_t> bytes;
+  };
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, Previous> previous_;
 
   // what the pending draws need, uploaded when they run
   std::vector<PendingDraw> pending_;
   std::vector<uint8_t> arena_;      // vertex arrays and indices, byte-addressed
-  std::vector<float> luts_;         // lookup tables, vec2 entries
+  std::unordered_map<uint64_t, uint32_t> arena_known_; // (address << 32 | bytes) -> where it is in the arena
+  std::vector<float> luts_;         // lookup tables, vec2 entries (kept across submits)
+  wgpu::Buffer luts_buffer_;        // them on the GPU (kLutCapacity floats), luts_uploaded_ of them sent
+  size_t luts_uploaded_ = 0;
+  static constexpr size_t kLutCapacity = 1u << 21; // 8 MiB: about 160 sets of tables
+  std::unordered_map<uint64_t, std::pair<std::vector<uint32_t>, uint32_t>> luts_known_; // content -> place
   std::vector<uint8_t> uniforms_;   // vertex shader and draw uniform blocks, 256-aligned
+  uint32_t last_vs_offset_ = UINT32_MAX, last_draw_offset_ = UINT32_MAX; // the last draw's blocks in it
   std::vector<uint32_t> last_light_tables_, last_fog_table_;
   uint32_t last_luts_at_ = UINT32_MAX;
 };

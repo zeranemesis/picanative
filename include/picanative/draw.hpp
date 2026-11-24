@@ -32,6 +32,7 @@ struct Config {
   bool upside_down = false;
   // fragment stage
   uint32_t textures = 0;                   // bits 0-2: units on
+  uint32_t anisotropy = 0;                 // PN_ANISOTROPY (an improvement, off: 0): textures read along their slope
   bool texture0_projected = false;
   bool texture2_coord1 = false;
   uint32_t tev[6][3] = {};                 // per stage: sources, operands, combiner (+ scale in tev_scale)
@@ -63,7 +64,8 @@ Config configure(const pica::State& state, const vertex::Layout& layout, bool in
 // The WGSL modules of a pipeline, entry points `vs` and `fs`, with the
 // bindings documented in draw.cpp. Separate, so that a vertex shader shared by
 // many pipelines compiles once.
-std::string vertex_wgsl(const Config& config, const pica::ShaderUnit& vertex_unit);
+// program: shadergen::vertex_function of the draw's unit, with the uniforms named "vsu"
+std::string vertex_wgsl(const Config& config, const std::string& program);
 std::string fragment_wgsl(const Config& config);
 
 // Uniform block of a draw, as the WGSL `Draw` struct lays it out: everything

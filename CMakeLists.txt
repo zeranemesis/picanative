@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.25)
 project(picanative LANGUAGES CXX)
+# symbols beside the optimized binaries (.pdb): profilers and crash reports name the functions
+if (MSVC)
+  add_compile_options(/Zi)
+  add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+endif ()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,6 +16,7 @@ add_library(picanative STATIC
   src/pica.cpp
   src/trace.cpp
   src/shadergen_vertex.cpp
+  src/shadergen_files.cpp
   src/texture.cpp
   src/transfer.cpp
   src/vertex.cpp
@@ -75,6 +81,10 @@ if (WIN32)
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:picanative_api> $<TARGET_FILE_DIR:picanative_api>
     COMMAND_EXPAND_LISTS)
 endif ()
+
+# translates a game's shader binaries ahead of time, for pn_load_shaders
+add_executable(pn_shaders tools/shaders.cpp)
+target_link_libraries(pn_shaders PRIVATE picanative)
 
 option(PICANATIVE_TOOLS "Build the test tools" ON)
 if (PICANATIVE_TOOLS)

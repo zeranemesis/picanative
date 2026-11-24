@@ -11,7 +11,9 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 namespace picanative {
 namespace {
@@ -56,8 +58,20 @@ void light_color(uint32_t v, float out[4]) {
 float fixed13(uint32_t v) { return static_cast<float>(static_cast<int32_t>((v & 0x1FFF) << 19) >> 19) / 2047.0f; }
 
 uint64_t fnv(const uint8_t* data, size_t size, uint64_t hash = 0xCBF29CE484222325ull) {
-  // whole words where possible, the hash only has to tell contents apart
+  // whole words where possible, the hash only has to tell contents apart. Four lanes side by side: each
+  // multiplication waits only on its own lane's last, so the processor runs four at once (textures are hashed
+  // every command list: this was most of the time spent on them)
   size_t i = 0;
+  if (size >= 64) {
+    uint64_t lane[4] = {hash, hash ^ 0x9E3779B97F4A7C15ull, hash ^ 0xBF58476D1CE4E5B9ull, hash ^ 0x94D049BB133111EBull};
+    for (; i + 32 <= size; i += 32) {
+      uint64_t w[4];
+      std::memcpy(w, data + i, 32);
+      for (int k = 0; k < 4; ++k) lane[k] = (lane[k] ^ w[k]) * 0x100000001B3ull;
+    }
+    hash = lane[0];
+    for (int k = 1; k < 4; ++k) hash = (hash ^ lane[k] ^ (lane[k] >> 29)) * 0x100000001B3ull;
+  }
   for (; i + 8 <= size; i += 8) {
     uint64_t word;
     std::memcpy(&word, data + i, 8);
@@ -146,13 +160,34 @@ constexpr const char* kDepthUploadWgsl = R"(
 
 // DisplayTransfer on the GPU: each invocation makes a word of the output,
 // byte for byte as transfer.cpp encodes it (little endian, linear lines).
-// p: output width, height, format | flip << 8 | first input line << 16, words.
+// p: output width, height (output pixels), format | flip << 8 | input format << 9 | (scale x - 1) << 12 |
+// (scale y - 1) << 13 | first input line << 16 | internal scale << 26, words. A downscale averages each 2x1 or
+// 2x2 block of the stored colors, rounding to nearest, as transfer.cpp.
 const char* kTransferWgsl = R"(
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> output: array<u32>;
 @group(0) @binding(2) var<uniform> p: vec4u;
-fn encoded(x: u32, y: u32, format: u32) -> u32 {
-  let c = vec4u(round(textureLoad(source, vec2u(x, y), 0) * 255.0));
+// the color as the surface's format in memory holds it (bits dropped, then widened back as the
+// transfer engine reads it), so that the output is what transfer.cpp makes from memory
+fn stored(c: vec4u, format: u32) -> vec4u {
+  switch format {
+    case 1u: { return vec4u(c.rgb, 255u); }
+    case 2u: {
+      let r = c.r >> 3u; let g = c.g >> 2u; let b = c.b >> 3u;
+      return vec4u((r << 3u) | (r >> 2u), (g << 2u) | (g >> 4u), (b << 3u) | (b >> 2u), 255u);
+    }
+    case 3u: {
+      let q = c.rgb >> vec3u(3u);
+      return vec4u((q << vec3u(3u)) | (q >> vec3u(2u)), select(0u, 255u, c.a >= 128u));
+    }
+    case 4u: { let q = c >> vec4u(4u); return (q << vec4u(4u)) | q; }
+    default: { return c; }
+  }
+}
+fn fetched(x: u32, y: u32) -> vec4u {
+  return stored(vec4u(round(textureLoad(source, vec2u(x, y), 0) * 255.0)), (p.z >> 9u) & 7u);
+}
+fn encoded(c: vec4u, format: u32) -> u32 {
   switch format {
     case 0u: { return c.a | (c.b << 8u) | (c.g << 16u) | (c.r << 24u); }
     case 1u: { return c.b | (c.g << 8u) | (c.r << 16u); }
@@ -168,6 +203,8 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
   let flip = ((p.z >> 8u) & 1u) != 0u;
   let first = (p.z >> 16u) & 1023u;
   let scale = p.z >> 26u; // one sample per block of the scaled surface
+  let sx = ((p.z >> 12u) & 1u) + 1u;
+  let sy = ((p.z >> 13u) & 1u) + 1u;
   let bpp = select(2u, select(3u, 4u, format == 0u), format <= 1u);
   var word = 0u;
   for (var b = 0u; b < 4u; b++) {
@@ -175,8 +212,16 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
     let pixel = at / bpp;
     if (pixel >= p.x * p.y) { break; }
     let line = pixel / p.x;
-    let y = first + select(line, p.y - 1u - line, flip);
-    word |= ((encoded((pixel % p.x) * scale, y * scale, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
+    let y = select(line, p.y - 1u - line, flip); // the copied line, from the first
+    var sum = vec4u(0u);
+    for (var dy = 0u; dy < sy; dy++) {
+      for (var dx = 0u; dx < sx; dx++) {
+        sum += fetched(((pixel % p.x) * sx + dx) * scale, (first + y * sy + dy) * scale);
+      }
+    }
+    let count = sx * sy;
+    let c = (sum + vec4u(count / 2u)) / vec4u(count);
+    word |= ((encoded(c, format) >> ((at % bpp) * 8u)) & 0xFFu) << (b * 8u);
   }
   output[i] = word;
 }
@@ -187,12 +232,25 @@ fn encoded(x: u32, y: u32, format: u32) -> u32 {
 struct Renderer::Surface {
   uint32_t address, width, height;
   bool depth;
-  // a color surface's format in memory (the GPU holds it as RGBA8); depth is D24S8
+  // a color surface's format in memory (the GPU holds it as RGBA8); a depth surface's, register 0x116:
+  // 0 D16, 2 D24, 3 D24S8 (the GPU holds all three as Depth32FloatStencil8)
   ColorFormat format = ColorFormat::RGBA8;
-  uint32_t bytes() const { return width * height * (depth ? 4 : bytes_per_pixel(format)); }
+  uint32_t depth_format = 3;
+  uint32_t pixel_bytes() const { return depth ? (depth_format == 0 ? 2 : depth_format == 2 ? 3 : 4) : bytes_per_pixel(format); }
+  uint32_t bytes() const { return width * height * pixel_bytes(); }
   wgpu::Texture texture;
   bool loaded = false; // holds what memory had, in this command list
   bool drawn = false;  // drawn into since, to write back
+  // memory as it was when drawing began: the console's GPU writes at once, this one when the range is read; bytes the
+  // game changed meanwhile (the buffer freed and given to other data) are its own, the write-back leaves them
+  std::vector<uint8_t> before;
+  bool pending = false; // told to on_pending
+  wgpu::TextureView view; // to sample it as a texture (render to texture), made at the first such use
+  uint64_t version = 0;    // drawn into: one more (a depth buffer read as a color texture is made again)
+  // a D24S8 depth buffer read as an RGBA8 texture: its words as the console's memory has them, on the GPU
+  wgpu::Texture as_color;
+  wgpu::TextureView as_color_view;
+  uint64_t as_color_version = ~0ull;
 };
 
 struct Renderer::Texture {
@@ -321,8 +379,21 @@ void Renderer::command_list(uint32_t address, uint32_t size) {
       else ++it;
   }
   // the CPU may have changed textures since the last list unless the host
-  // reports its writes; within a list it cannot
-  if (!trusted_) known_.clear();
+  // reports its writes; within a list it cannot. VRAM is the exception: what
+  // writes it (DMA, fills, transfers, copies, the GPU) goes through the engine,
+  // which forgets the textures there; so a VRAM texture stays known, unless a
+  // surface overlaps it (the GPU may draw into it again in this list).
+  // shortcut: the CPU writing VRAM directly goes unseen; no game seen does,
+  // keep this clear() for one that does (PN_TRUST_CPU_WRITES aside)
+  if (!trusted_) {
+    for (auto it = known_.begin(); it != known_.end();) {
+      const Known& k = it->second;
+      bool keep = k.address >= 0x18000000 && k.address + k.bytes <= 0x18600000;
+      for (const auto& [key, s] : surfaces_)
+        if (keep && k.address < s->address + s->bytes() && s->address < k.address + k.bytes) keep = false;
+      it = keep ? std::next(it) : known_.erase(it);
+    }
+  }
   processor_.run(address, size);
   if (cached_) {
     flush(false);
@@ -338,12 +409,14 @@ Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t 
   if (!slot) {
     slot = std::make_unique<Surface>();
     slot->address = address, slot->width = width, slot->height = height, slot->depth = depth;
-    slot->format = static_cast<ColorFormat>(format);
+    if (depth) slot->depth_format = format;
+    else slot->format = static_cast<ColorFormat>(format);
     wgpu::TextureDescriptor td{};
     td.size = {width * scale_, height * scale_, 1};
     td.format = depth ? wgpu::TextureFormat::Depth32FloatStencil8 : wgpu::TextureFormat::RGBA8Unorm;
     td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
-    if (!depth) td.usage |= wgpu::TextureUsage::TextureBinding; // read by the GPU transfers
+    if (!depth) td.usage |= wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::StorageBinding; // GPU transfers
+    else td.usage |= wgpu::TextureUsage::TextureBinding; // read as a color texture (depth_as_color)
     slot->texture = gpu_.device.CreateTexture(&td);
   }
   return *slot;
@@ -355,7 +428,7 @@ void Renderer::load(Surface& s) {
   deliver(s.address, s.bytes());
   Timed timed{stats_.load};
   s.loaded = true;
-  const uint32_t bpp = s.depth ? 4 : bytes_per_pixel(s.format);
+  const uint32_t bpp = s.pixel_bytes();
   const uint8_t* bytes = memory_.map(s.address, s.width * s.height * bpp);
   const uint32_t n = scale_, sw = s.width * n, sh = s.height * n;
   // each of the console's pixels, repeated n x n
@@ -387,16 +460,18 @@ void Renderer::load(Surface& s) {
     gpu_.queue.WriteTexture(&dst, big.data(), big.size(), &layout, &extent);
     return;
   }
-  // D24S8: the stencil straight into its aspect, the depth by a pass
+  // the stencil straight into its aspect (0 without one), the depth by a pass, as 24 bits: D16 widened (v * 0xFFFFFF / 0xFFFF)
   std::vector<uint8_t> stencil(size_t{s.width} * s.height, 0);
   std::vector<uint32_t> depth(size_t{s.width} * s.height, 0);
   if (bytes)
     for (uint32_t y = 0; y < s.height; ++y)
       for (uint32_t x = 0; x < s.width; ++x) {
-        uint32_t word;
-        std::memcpy(&word, bytes + tiled_offset(x, y, s.width, 4), 4);
-        depth[size_t{y} * s.width + x] = word & 0xFFFFFF;
-        stencil[size_t{y} * s.width + x] = static_cast<uint8_t>(word >> 24);
+        uint32_t word = 0;
+        std::memcpy(&word, bytes + tiled_offset(x, y, s.width, bpp), bpp);
+        const size_t at = size_t{y} * s.width + x;
+        if (bpp == 2) depth[at] = word << 8 | word >> 8;
+        else depth[at] = word & 0xFFFFFF;
+        if (bpp == 4) stencil[at] = static_cast<uint8_t>(word >> 24);
       }
   const auto big_stencil = grow(stencil);
   const auto big_depth = grow(depth);
@@ -419,11 +494,32 @@ void Renderer::load(Surface& s) {
   pending_.push_back(upload);
 }
 
-// back to memory, tiled, as the PICA leaves its buffers
+void Renderer::remember(Surface& s) {
+  const uint8_t* bytes = memory_.map(s.address, s.bytes());
+  if (bytes) s.before.assign(bytes, bytes + s.bytes());
+  else s.before.clear();
+  if (on_pending && !s.pending) s.pending = true, on_pending(s.address, s.bytes(), true);
+}
+
+// back to memory, tiled, as the PICA leaves its buffers; bytes the game wrote since drawing began kept (remember)
 void Renderer::store(Surface& s, const std::vector<uint8_t>& data) {
   Timed timed{stats_.store};
-  uint8_t* bytes = memory_.map(s.address, s.bytes());
-  if (!bytes) return;
+  uint8_t* memory = memory_.map(s.address, s.bytes());
+  if (!memory) return;
+  const size_t size = s.bytes();
+  const bool changed = s.before.size() == size && std::memcmp(memory, s.before.data(), size) != 0;
+  std::vector<uint8_t> merged;
+  if (changed) merged.assign(memory, memory + size), ++stats_.stores_merged;
+  uint8_t* bytes = changed ? merged.data() : memory;
+  struct Merge { // on leaving: the stored pixels into memory where the game left it alone
+    Surface& s; uint8_t* memory; const std::vector<uint8_t>& merged; bool changed;
+    ~Merge() {
+      if (changed)
+        for (size_t i = 0; i < merged.size(); ++i)
+          if (memory[i] == s.before[i]) memory[i] = merged[i];
+      s.before.clear();
+    }
+  } merge{s, memory, merged, changed};
   // the readback is at the scale: one sample per block, its top left
   const uint32_t n = scale_, row = align_up(s.width * n * 4, 256);
   if (!s.depth) {
@@ -440,9 +536,15 @@ void Renderer::store(Surface& s, const std::vector<uint8_t>& data) {
     for (uint32_t x = 0; x < s.width; ++x) {
       float d;
       std::memcpy(&d, &data[size_t{y * n} * row + x * n * 4], 4);
+      const uint32_t bpp = s.pixel_bytes();
+      if (bpp == 2) {
+        const uint32_t d16 = static_cast<uint32_t>(std::lround(std::clamp(d, 0.0f, 1.0f) * 65535.0f)); // exact back
+        std::memcpy(bytes + tiled_offset(x, y, s.width, 2), &d16, 2);
+        continue;
+      }
       const uint32_t d24 = static_cast<uint32_t>(std::clamp(d, 0.0f, 1.0f) * 16777215.0f);
       const uint32_t word = d24 | uint32_t{data[stencil_at + size_t{y * n} * stencil_row + x * n]} << 24;
-      std::memcpy(bytes + tiled_offset(x, y, s.width, 4), &word, 4);
+      std::memcpy(bytes + tiled_offset(x, y, s.width, bpp), &word, bpp); // D24: its 3 low bytes
     }
 }
 
@@ -450,7 +552,12 @@ uint32_t Renderer::arena_copy(uint32_t address, uint32_t size) {
   // from a word boundary, so the shader reads whole words; the return is
   // where `address` lands in the arena
   const uint32_t aligned = address & ~3u, lead = address - aligned, total = align_up(size + lead, 4);
+  // the same range copied before in this submit (one vertex array for many draws): that copy again; memory does
+  // not change while the arena fills (a submit's lists run while the CPU waits)
+  auto [known, added] = arena_known_.try_emplace(uint64_t{aligned} << 32 | total, 0u);
+  if (!added) return known->second + lead;
   const uint32_t at = static_cast<uint32_t>(arena_.size());
+  known->second = at;
   arena_.resize(arena_.size() + total, 0);
   if (const uint8_t* bytes = memory_.map(aligned, total)) {
     std::memcpy(arena_.data() + at, bytes, total);
@@ -469,6 +576,12 @@ uint32_t Renderer::lookup_tables(const pica::State& state) {
     return last_luts_at_;
   last_light_tables_.assign(lights_now, lights_now + 24 * 256);
   last_fog_table_.assign(state.fog_table.begin(), state.fog_table.end());
+  // the same tables met before (materials take turns): their place again
+  std::vector<uint32_t> content(last_light_tables_);
+  content.insert(content.end(), last_fog_table_.begin(), last_fog_table_.end());
+  const uint64_t hash = fnv(reinterpret_cast<const uint8_t*>(content.data()), content.size() * 4);
+  if (const auto seen = luts_known_.find(hash); seen != luts_known_.end() && seen->second.first == content)
+    return last_luts_at_ = seen->second.second;
   const std::vector<uint32_t>& lights = last_light_tables_;
   const std::vector<uint32_t>& fog = last_fog_table_;
   const uint32_t at = static_cast<uint32_t>(luts_.size() / 2);
@@ -482,6 +595,7 @@ uint32_t Renderer::lookup_tables(const pica::State& state) {
     luts_.push_back(static_cast<float>(static_cast<int32_t>((w & 0x1FFF) << 19) >> 19) / 2048.0f);
   }
   last_luts_at_ = at;
+  luts_known_[hash] = {std::move(content), at};
   return at;
 }
 
@@ -530,9 +644,52 @@ wgpu::Sampler Renderer::sampler(uint32_t config) {
   sd.magFilter = filter(key >> 1 & 1);
   sd.minFilter = filter(key >> 2 & 1);
   sd.mipmapFilter = key >> 24 & 1 ? wgpu::MipmapFilterMode::Linear : wgpu::MipmapFilterMode::Nearest;
+  // PN_ANISOTROPY=n: textures the game filters linearly read along their slope, n samples at most
+  static const int anisotropy = std::getenv("PN_ANISOTROPY") ? std::atoi(std::getenv("PN_ANISOTROPY")) : 0;
+  if (anisotropy > 1 && (key >> 2 & 1)) {
+    sd.magFilter = sd.minFilter = wgpu::FilterMode::Linear;
+    sd.mipmapFilter = wgpu::MipmapFilterMode::Linear;
+    sd.maxAnisotropy = static_cast<uint16_t>(std::min(anisotropy, 16));
+  }
   slot = gpu_.device.CreateSampler(&sd);
   return slot;
 }
+
+namespace {
+// textures as files (uncompressed 32-bit TGA: any editor reads and writes it), named by content: a pack of
+// replacements made from a dump works from one run to the next, wherever the game puts its textures
+void write_tga(const std::string& path, uint32_t w, uint32_t h, const uint8_t* rgba) {
+  std::ofstream out(path, std::ios::binary);
+  uint8_t header[18] = {};
+  header[2] = 2, header[12] = w & 0xFF, header[13] = w >> 8, header[14] = h & 0xFF, header[15] = h >> 8;
+  header[16] = 32, header[17] = 0x28; // top-left origin, 8 bits of alpha
+  out.write(reinterpret_cast<const char*>(header), 18);
+  std::vector<uint8_t> bgra(size_t{w} * h * 4);
+  for (size_t i = 0; i < size_t{w} * h; ++i)
+    bgra[i * 4] = rgba[i * 4 + 2], bgra[i * 4 + 1] = rgba[i * 4 + 1], bgra[i * 4 + 2] = rgba[i * 4], bgra[i * 4 + 3] = rgba[i * 4 + 3];
+  out.write(reinterpret_cast<const char*>(bgra.data()), static_cast<std::streamsize>(bgra.size()));
+}
+bool read_tga(const std::string& path, uint32_t& w, uint32_t& h, std::vector<uint8_t>& rgba) {
+  std::ifstream in(path, std::ios::binary);
+  uint8_t header[18];
+  if (!in.read(reinterpret_cast<char*>(header), 18) || header[2] != 2 || (header[16] != 32 && header[16] != 24)) return false;
+  w = header[12] | header[13] << 8, h = header[14] | header[15] << 8;
+  const uint32_t bpp = header[16] / 8;
+  if (!w || !h || w > 8192 || h > 8192) return false;
+  in.seekg(18 + header[0]);
+  std::vector<uint8_t> raw(size_t{w} * h * bpp);
+  if (!in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()))) return false;
+  rgba.resize(size_t{w} * h * 4);
+  const bool top_down = header[17] & 0x20;
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      const uint8_t* p = &raw[(size_t{top_down ? y : h - 1 - y} * w + x) * bpp];
+      uint8_t* o = &rgba[(size_t{y} * w + x) * 4];
+      o[0] = p[2], o[1] = p[1], o[2] = p[0], o[3] = bpp == 4 ? p[3] : 0xFF;
+    }
+  return true;
+}
+} // namespace
 
 wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t size[4], float border[4],
                                     float lod[4]) {
@@ -552,21 +709,74 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   const uint32_t largest = lod_reg >> 16 & 0xF;
   const uint32_t tz = std::min<uint32_t>(std::countr_zero(width), std::countr_zero(height));
   const uint32_t levels = 1 + std::min(largest, tz >= 3 ? tz - 3 : 0);
-  size[0] = width, size[1] = height, size[2] = levels, size[3] = config;
-  const uint32_t max = std::min(largest, levels - 1);
+  // PN_MIPMAPS=1: a texture with no smaller levels that the game filters linearly gets them, averaged here
+  static const bool mipmaps = std::getenv("PN_MIPMAPS") != nullptr;
+  const uint32_t made = mipmaps && levels == 1 && (config >> 2 & 1) && std::has_single_bit(width) &&
+                                std::has_single_bit(height) && std::min(width, height) >= 16
+                            ? 1 + std::countr_zero(std::min(width, height)) - 2 // down to 4 texels
+                            : 0;
+  size[0] = width, size[1] = height, size[2] = made ? made : levels, size[3] = config;
+  const uint32_t max = made ? made - 1 : std::min(largest, levels - 1);
   lod[0] = static_cast<float>(static_cast<int32_t>(lod_reg << 19) >> 19) / 256.0f;
-  lod[1] = static_cast<float>(std::min(lod_reg >> 24 & 0xF, max));
+  lod[1] = made ? 0.0f : static_cast<float>(std::min(lod_reg >> 24 & 0xF, max));
   lod[2] = static_cast<float>(max);
   lod[3] = static_cast<float>((config >> 2 & 1) | (config >> 24 & 1) << 1);
 
+  ++stats_.tex_calls;
+  // render to texture: a texture that is a color buffer the GPU holds (drawn or loaded), of the same size and
+  // format, is read from the GPU as it is, without the trip through memory (finish the work, read back, encode,
+  // hash, decode, send again) that cost Smash a quarter of its time. Not the buffer the draw renders into.
+  // RGBA8 only: the others would be read at 8 bits where the console has its few (PN_RTT_ALL=1 takes them,
+  // to measure); PN_NO_RTT=1 turns it off
+  static const bool rtt = std::getenv("PN_NO_RTT") == nullptr, rtt_all = std::getenv("PN_RTT_ALL") != nullptr;
+  if (rtt && cached_ && levels == 1 && format <= 4 && address != (r[0x11D] & 0x0FFFFFFF) << 3) {
+    static constexpr ColorFormat as_buffer[5] = {ColorFormat::RGBA8, ColorFormat::RGB8, ColorFormat::RGB5A1,
+                                                 ColorFormat::RGB565, ColorFormat::RGBA4};
+    for (auto& [key, s] : surfaces_) {
+      if (s->depth || s->address != address || s->width != width || s->height != height ||
+          s->format != as_buffer[format] || !(s->drawn || s->loaded))
+        continue;
+      ++stats_.rtt_seen[format];
+      if (format != 0 && !rtt_all) break;
+      ++stats_.textures_from_buffers;
+      if (!s->view) s->view = s->texture.CreateView();
+      return s->view;
+    }
+    // a D24S8 depth buffer read as RGBA8 (Pokemon's effects): its words made on the GPU as memory would hold them
+    if (format == 0)
+      for (auto& [key, s] : surfaces_)
+        if (s->depth && s->depth_format == 3 && s->address == address && s->width == width && s->height == height &&
+            (s->drawn || s->loaded)) {
+          ++stats_.textures_from_depth;
+          return depth_as_color(*s);
+        }
+  }
   uint32_t bytes = 0;
   for (uint32_t l = 0; l < levels; ++l) bytes += texture::size(format, std::max(width >> l, 1u), std::max(height >> l, 1u));
+  // PN_RTT_LOG=1: textures over a drawn color buffer the fast way above did not take (the first 40 kinds)
+  static const bool rtt_log = std::getenv("PN_RTT_LOG") != nullptr;
+  if (rtt_log)
+    for (auto& [key, s] : surfaces_)
+      if (s->drawn && address < s->address + s->bytes() && s->address < address + bytes) {
+        static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> told;
+        const auto kind = std::tuple{width, height, format, levels, s->width, s->height,
+                                     static_cast<uint32_t>(s->format) | (s->depth ? 0x100u : 0u) | (address - s->address) << 12};
+        if (told.size() < 40 && told.insert(kind).second)
+          std::fprintf(stderr, "[picanative] texture %08x %ux%u format %u levels %u over a drawn %s buffer %08x %ux%u format %u\n",
+                       address, width, height, format, levels, s->depth ? "depth" : "color", s->address, s->width, s->height,
+                       s->depth ? s->depth_format : static_cast<uint32_t>(s->format));
+      }
   // drawn into in this command list: memory has to get it first
-  write_back(address, bytes, false);
   {
+    Timed t{stats_.tex_writeback};
+    write_back(address, bytes, false);
+  }
+  {
+    Timed t{stats_.tex_known};
     const auto found = known_.find({address, format, width | height << 16, levels});
     if (found != known_.end()) return found->second.texture->view;
   }
+  Timed hashing{stats_.tex_hash};
   const uint8_t* data = memory_.map(address, bytes);
   std::vector<uint8_t> copy;
   if (!data) {
@@ -581,21 +791,131 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   auto& slot = textures_[key];
   if (slot) known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
   if (slot) return slot->view;
+  Timed decoding{stats_.tex_decode};
+  // PN_TEXTURE_DUMP=folder: each texture with no smaller levels saved as <content>.tga; PN_TEXTURE_PACK=folder:
+  // one of the same name there taken in its place, at its own size (an HD pack; improvements, both off)
+  static const char* dump_dir = std::getenv("PN_TEXTURE_DUMP");
+  static const char* pack_dir = std::getenv("PN_TEXTURE_PACK");
+  if ((dump_dir || pack_dir) && levels == 1) {
+    const uint32_t shape[2] = {format, width | height << 16};
+    const uint64_t content = fnv(reinterpret_cast<const uint8_t*>(shape), sizeof shape, fnv(data, bytes));
+    char name[40];
+    std::snprintf(name, sizeof name, "%016llx.tga", static_cast<unsigned long long>(content));
+    if (pack_dir) {
+      uint32_t w = 0, h = 0;
+      std::vector<uint8_t> rgba;
+      if (read_tga(std::string(pack_dir) + "/" + name, w, h, rgba)) {
+        slot = std::make_unique<Texture>();
+        wgpu::TextureDescriptor td{};
+        td.size = {w, h, 1};
+        td.format = wgpu::TextureFormat::RGBA8Unorm;
+        td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
+        slot->texture = gpu_.device.CreateTexture(&td);
+        wgpu::TexelCopyTextureInfo dst{};
+        dst.texture = slot->texture;
+        wgpu::TexelCopyBufferLayout layout{};
+        layout.bytesPerRow = w * 4;
+        layout.rowsPerImage = h;
+        wgpu::Extent3D extent{w, h, 1};
+        gpu_.queue.WriteTexture(&dst, rgba.data(), rgba.size(), &layout, &extent);
+        slot->view = slot->texture.CreateView();
+        ++stats_.textures_replaced;
+        known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
+        return slot->view;
+      }
+    }
+    if (dump_dir) {
+      const std::string path = std::string(dump_dir) + "/" + name;
+      if (!std::ifstream(path)) {
+        std::vector<uint8_t> rgba;
+        texture::decode(format, data, bytes, width, height, rgba);
+        write_tga(path, width, height, rgba.data());
+      }
+    }
+  }
+  // a large texture the game changes in part (an atlas it streams tiles into): the rows of 8x8 tiles that
+  // changed, decoded and sent alone, into the same GPU texture (once the work using its old content is sent)
+  const auto place = std::tuple{address, format, width | height << 16, levels};
+  constexpr uint32_t kPartial = 0x40000;
+  const uint32_t row_bytes = texture::size(format, width, 8), rows = height / 8;
+  if (bytes >= kPartial && levels == 1 && rows && row_bytes * rows == bytes) {
+    const auto before = previous_.find(place);
+    if (before != previous_.end()) {
+      const auto old = textures_.find(before->second.key);
+      if (old != textures_.end() && old->second && before->second.bytes.size() == bytes) {
+        std::vector<uint32_t> changed;
+        for (uint32_t r = 0; r < rows; ++r)
+          if (std::memcmp(data + size_t{r} * row_bytes, before->second.bytes.data() + size_t{r} * row_bytes, row_bytes))
+            changed.push_back(r);
+        if (changed.size() * 2 <= rows) {
+          if (!pending_.empty()) flush(false); // draws recorded with the old content first
+          slot = std::move(old->second);
+          textures_.erase(old);
+          std::vector<uint8_t> rgba;
+          for (size_t i = 0; i < changed.size();) {
+            size_t j = i + 1;
+            while (j < changed.size() && changed[j] == changed[j - 1] + 1) ++j;
+            const uint32_t first = changed[i], count = static_cast<uint32_t>(j - i);
+            texture::decode(format, data + size_t{first} * row_bytes, size_t{count} * row_bytes, width, count * 8, rgba);
+            wgpu::TexelCopyTextureInfo dst{};
+            dst.texture = slot->texture;
+            dst.origin = {0, first * 8, 0};
+            wgpu::TexelCopyBufferLayout layout{};
+            layout.bytesPerRow = width * 4;
+            layout.rowsPerImage = count * 8;
+            wgpu::Extent3D extent{width, count * 8, 1};
+            gpu_.queue.WriteTexture(&dst, rgba.data(), rgba.size(), &layout, &extent);
+            i = j;
+          }
+          ++stats_.textures_updated;
+          before->second.key = key;
+          before->second.bytes.assign(data, data + bytes);
+          known_[place] = {address, bytes, slot.get()};
+          return slot->view;
+        }
+      }
+    }
+  }
   slot = std::make_unique<Texture>();
   ++stats_.textures_decoded;
+  // PN_TEXTURE_LOG: which textures are decoded again and again (address, format, size, drawn there by the GPU?)
+  static const bool log = std::getenv("PN_TEXTURE_LOG") != nullptr;
+  if (log) {
+    static std::map<std::tuple<uint32_t, uint32_t, uint32_t>, uint64_t> decoded;
+    const uint64_t n = ++decoded[{address, format, width | height << 16}];
+    bool surface = false;
+    for (const auto& [k, s] : surfaces_)
+      if (address < s->address + s->bytes() && s->address < address + bytes) surface = true;
+    if (n == 10 || n == 100 || n == 1000 || n == 10000)
+      std::fprintf(stderr, "[picanative] texture %08x format %u %ux%u decoded %llu times%s\n", address, format, width,
+                   height, static_cast<unsigned long long>(n), surface ? " (a surface the GPU draws)" : "");
+  }
   wgpu::TextureDescriptor td{};
   td.size = {width, height, 1};
-  td.mipLevelCount = levels;
+  td.mipLevelCount = made ? made : levels;
   td.format = wgpu::TextureFormat::RGBA8Unorm;
   td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
   slot->texture = gpu_.device.CreateTexture(&td);
   std::vector<uint8_t> rgba;
   uint32_t at = 0;
-  for (uint32_t l = 0; l < levels; ++l) {
+  for (uint32_t l = 0; l < td.mipLevelCount; ++l) {
     const uint32_t w = std::max(width >> l, 1u), h = std::max(height >> l, 1u);
-    const uint32_t level_bytes = texture::size(format, w, h);
-    texture::decode(format, data + at, level_bytes, w, h, rgba);
-    at += level_bytes;
+    if (l < levels) {
+      const uint32_t level_bytes = texture::size(format, w, h);
+      texture::decode(format, data + at, level_bytes, w, h, rgba);
+      at += level_bytes;
+    } else { // a made level: each texel the average of the four above it
+      std::vector<uint8_t> half(size_t{w} * h * 4);
+      const uint32_t pw = w * 2;
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+          for (uint32_t k = 0; k < 4; ++k) {
+            const auto px = [&](uint32_t xx, uint32_t yy) { return uint32_t{rgba[(size_t{yy} * pw + xx) * 4 + k]}; };
+            half[(size_t{y} * w + x) * 4 + k] =
+                static_cast<uint8_t>((px(2 * x, 2 * y) + px(2 * x + 1, 2 * y) + px(2 * x, 2 * y + 1) + px(2 * x + 1, 2 * y + 1) + 2) / 4);
+          }
+      rgba.swap(half);
+    }
     wgpu::TexelCopyTextureInfo dst{};
     dst.texture = slot->texture;
     dst.mipLevel = l;
@@ -607,7 +927,124 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
   }
   slot->view = slot->texture.CreateView();
   known_[{address, format, width | height << 16, levels}] = {address, bytes, slot.get()};
+  if (bytes >= kPartial && levels == 1) previous_[place] = {key, std::vector<uint8_t>(data, data + bytes)};
   return slot->view;
+}
+
+bool Renderer::load_translations(const std::string& path, std::string& error) {
+  shadergen::Translations loaded;
+  if (!shadergen::load_translations(path, loaded, error)) return false;
+  stats_.programs_ahead += loaded.size();
+  translations_.merge(loaded);
+  return true;
+}
+
+struct Renderer::Described {
+  wgpu::RenderPipelineDescriptor pd{};
+  wgpu::ColorTargetState target{};
+  wgpu::BlendState blend{};
+  wgpu::FragmentState fs{};
+  wgpu::DepthStencilState ds{};
+};
+
+wgpu::RenderPipelineDescriptor* Renderer::describe(const Recipe& r, Described& d) {
+  auto shared = [&](const std::string& text) {
+    auto& slot = modules_[text];
+    if (!slot) slot = module(gpu_, text);
+    return slot;
+  };
+  const auto& s = r.state;
+  d.pd.layout = pipeline_layout_;
+  d.pd.vertex.module = shared(r.vertex);
+  d.pd.vertex.entryPoint = "vs";
+  d.pd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+  d.pd.primitive.cullMode = static_cast<wgpu::CullMode>(s[0]);
+  d.pd.primitive.frontFace = static_cast<wgpu::FrontFace>(s[1]);
+  d.target.format = wgpu::TextureFormat::RGBA8Unorm;
+  d.target.writeMask = static_cast<wgpu::ColorWriteMask>(s[2]);
+  if (s[3]) {
+    d.blend.color = {static_cast<wgpu::BlendOperation>(s[4]), static_cast<wgpu::BlendFactor>(s[5]),
+                     static_cast<wgpu::BlendFactor>(s[6])};
+    d.blend.alpha = {static_cast<wgpu::BlendOperation>(s[7]), static_cast<wgpu::BlendFactor>(s[8]),
+                     static_cast<wgpu::BlendFactor>(s[9])};
+    d.target.blend = &d.blend;
+  }
+  d.fs.module = shared(r.fragment);
+  d.fs.entryPoint = "fs";
+  d.fs.targetCount = 1;
+  d.fs.targets = &d.target;
+  d.pd.fragment = &d.fs;
+  d.ds.format = wgpu::TextureFormat::Depth32FloatStencil8;
+  d.ds.depthWriteEnabled = s[10] ? wgpu::OptionalBool::True : wgpu::OptionalBool::False;
+  d.ds.depthCompare = static_cast<wgpu::CompareFunction>(s[11]);
+  if (s[12]) {
+    wgpu::StencilFaceState face{};
+    face.compare = static_cast<wgpu::CompareFunction>(s[13]);
+    face.failOp = static_cast<wgpu::StencilOperation>(s[14]);
+    face.depthFailOp = static_cast<wgpu::StencilOperation>(s[15]);
+    face.passOp = static_cast<wgpu::StencilOperation>(s[16]);
+    d.ds.stencilFront = d.ds.stencilBack = face;
+  }
+  d.ds.stencilReadMask = s[17];
+  d.ds.stencilWriteMask = s[18];
+  d.pd.depthStencil = &d.ds;
+  return &d.pd;
+}
+
+// on Dawn's threads; the draws that need it wait for it (pipeline())
+void Renderer::start_pipeline(const Recipe& recipe) {
+  if (pipelines_.count(recipe.id) || compiling_.count(recipe.id)) return;
+  Described d;
+  wgpu::RenderPipelineDescriptor* pd = describe(recipe, d);
+  compiling_.insert(recipe.id);
+  const std::string id = recipe.id, source = recipe.vertex + recipe.fragment;
+  wgpu::Future f = gpu_.device.CreateRenderPipelineAsync(
+      pd, wgpu::CallbackMode::WaitAnyOnly,
+      [this, id, source](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline ready, wgpu::StringView message) {
+        compiling_.erase(id);
+        warming_.erase(id);
+        if (status != wgpu::CreatePipelineAsyncStatus::Success) {
+          ++stats_.shader_errors;
+          if (errors.size() < 3) errors.push_back(std::string(message.data, message.length) + "\n--- WGSL ---\n" + source);
+        }
+        pipelines_[id] = std::move(ready);
+      });
+  futures_.push_back(f);
+  warming_[id] = f;
+}
+
+namespace {
+void put_string(std::ofstream& out, const std::string& s) {
+  const uint32_t n = static_cast<uint32_t>(s.size());
+  out.write(reinterpret_cast<const char*>(&n), 4);
+  out.write(s.data(), n);
+}
+bool get_string(std::ifstream& in, std::string& s) {
+  uint32_t n = 0;
+  if (!in.read(reinterpret_cast<char*>(&n), 4) || n > (64u << 20)) return false;
+  s.resize(n);
+  return static_cast<bool>(in.read(s.data(), n));
+}
+} // namespace
+
+size_t Renderer::warm_pipelines(const std::string& path) {
+  recipes_path_ = path;
+  std::ifstream in(path, std::ios::binary);
+  size_t started = 0;
+  // records: id, vertex, fragment, state count, state words; a torn last one (a run that crashed) is dropped
+  for (Recipe r; in;) {
+    uint32_t n = 0;
+    if (!get_string(in, r.id) || !get_string(in, r.vertex) || !get_string(in, r.fragment) ||
+        !in.read(reinterpret_cast<char*>(&n), 4) || n != 19)
+      break;
+    r.state.resize(n);
+    if (!in.read(reinterpret_cast<char*>(r.state.data()), n * 4)) break;
+    if (!recipes_known_.insert(r.id).second) continue;
+    start_pipeline(r);
+    ++started;
+  }
+  stats_.pipelines_warmed += started;
+  return started;
 }
 
 wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::ShaderUnit& vs) {
@@ -616,41 +1053,56 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
   auto found = pipelines_.find(id);
   if (found != pipelines_.end()) return found->second;
   if (compiling_.count(id)) {
+    if (auto p = warming_.find(id); p != warming_.end()) {
+      const wgpu::Future f = p->second;
+      gpu_.instance.WaitAny(f, async_ ? 20'000'000 : UINT64_MAX);
+      if (const auto done = pipelines_.find(id); done != pipelines_.end()) return done->second;
+    }
     ++stats_.waiting;
     return nullptr;
   }
   ++stats_.pipelines;
   Timed timed{stats_.pipelines_time};
-  const std::string vertex_source = draw::vertex_wgsl(c, vs), fragment_source = draw::fragment_wgsl(c);
+  auto program = translations_.find(c.program);
+  // PN_CHECK_SHADERS=1: each program translated ahead against its translation now, and against the
+  // translation of the whole unit (what the engine translated before it kept only what is reachable)
+  static const bool check = std::getenv("PN_CHECK_SHADERS") != nullptr;
+  if (check && program != translations_.end() && checked_.insert(c.program).second) {
+    const std::string now = shadergen::vertex_function(vs, "vsu"), whole = shadergen::vertex_function(vs, "vsu", true);
+    std::fprintf(stderr, "[picanative] check %016llx: ahead %s now, %s the whole unit\n",
+                 static_cast<unsigned long long>(c.program), program->second == now ? "==" : "!=",
+                 program->second == whole ? "==" : "!=");
+    if (program->second != whole) // both, in the current folder
+      for (const auto& [name, text] : {std::pair{"ahead", program->second}, std::pair{"whole", whole}})
+        std::ofstream(std::to_string(c.program) + "-" + name + ".wgsl") << text;
+  }
+  if (program == translations_.end()) {
+    Timed translating{stats_.translating};
+    ++stats_.programs_translated;
+    if (stats_.programs_ahead)
+      std::fprintf(stderr, "[picanative] vertex program %016llx (entry %u) not translated ahead: translating it\n",
+                   static_cast<unsigned long long>(c.program), vs.entry_point);
+    program = translations_.emplace(c.program, shadergen::vertex_function(vs, "vsu")).first;
+  }
+  const std::string vertex_source = draw::vertex_wgsl(c, program->second), fragment_source = draw::fragment_wgsl(c);
   const std::string source = vertex_source + fragment_source; // for error reports
   wgpu::RenderPipeline result;
+  Recipe recipe{id, vertex_source, fragment_source, std::vector<uint32_t>(19, 0)};
   const std::string error = gpu::checked(gpu_, [&] {
-    // a module per source, shared by the pipelines that use it
     if (!modules_.count(vertex_source)) ++stats_.vertex_modules;
-    auto shared = [&](const std::string& text) {
-      auto& slot = modules_[text];
-      if (!slot) slot = module(gpu_, text);
-      return slot;
-    };
-    const wgpu::ShaderModule m = shared(vertex_source), fm = shared(fragment_source);
-    wgpu::RenderPipelineDescriptor pd{};
-    pd.layout = pipeline_layout_;
-    pd.vertex.module = m;
-    pd.vertex.entryPoint = "vs";
-    pd.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
+    auto& s = recipe.state;
     // the PICA's culling, seen with y pointing up: 1 drops counter-clockwise, 2 clockwise
-    pd.primitive.frontFace = wgpu::FrontFace::CCW;
-    if (c.cull == 1) pd.primitive.cullMode = c.upside_down ? wgpu::CullMode::Back : wgpu::CullMode::Front;
-    else if (c.cull == 2) pd.primitive.cullMode = c.upside_down ? wgpu::CullMode::Front : wgpu::CullMode::Back;
-    wgpu::ColorTargetState target{};
-    target.format = wgpu::TextureFormat::RGBA8Unorm;
+    wgpu::CullMode cull = wgpu::CullMode::None;
+    if (c.cull == 1) cull = c.upside_down ? wgpu::CullMode::Back : wgpu::CullMode::Front;
+    else if (c.cull == 2) cull = c.upside_down ? wgpu::CullMode::Front : wgpu::CullMode::Back;
+    s[0] = static_cast<uint32_t>(cull), s[1] = static_cast<uint32_t>(wgpu::FrontFace::CCW);
     wgpu::ColorWriteMask mask = wgpu::ColorWriteMask::None;
     if (c.color_mask & 1) mask |= wgpu::ColorWriteMask::Red;
     if (c.color_mask & 2) mask |= wgpu::ColorWriteMask::Green;
     if (c.color_mask & 4) mask |= wgpu::ColorWriteMask::Blue;
     if (c.color_mask & 8) mask |= wgpu::ColorWriteMask::Alpha;
     if (c.logic_mode == 7) mask = wgpu::ColorWriteMask::None; // no-op: the buffer keeps its color
-    target.writeMask = mask;
+    s[2] = static_cast<uint32_t>(mask);
     wgpu::BlendState blend{};
     if (c.logic_mode == 0) {
       blend.color = {blend_op(c.blend), blend_factor(c.blend >> 16), blend_factor(c.blend >> 20)};
@@ -660,50 +1112,38 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
         blend.color.srcFactor = blend.color.dstFactor = wgpu::BlendFactor::One;
       if (blend.alpha.operation == wgpu::BlendOperation::Min || blend.alpha.operation == wgpu::BlendOperation::Max)
         blend.alpha.srcFactor = blend.alpha.dstFactor = wgpu::BlendFactor::One;
-      target.blend = &blend;
+      s[3] = 1;
+      s[4] = static_cast<uint32_t>(blend.color.operation), s[5] = static_cast<uint32_t>(blend.color.srcFactor);
+      s[6] = static_cast<uint32_t>(blend.color.dstFactor), s[7] = static_cast<uint32_t>(blend.alpha.operation);
+      s[8] = static_cast<uint32_t>(blend.alpha.srcFactor), s[9] = static_cast<uint32_t>(blend.alpha.dstFactor);
     }
-    wgpu::FragmentState fs{};
-    fs.module = fm;
-    fs.entryPoint = "fs";
-    fs.targetCount = 1;
-    fs.targets = &target;
-    pd.fragment = &fs;
-    wgpu::DepthStencilState ds{};
-    ds.format = wgpu::TextureFormat::Depth32FloatStencil8;
-    ds.depthWriteEnabled = c.depth_write ? wgpu::OptionalBool::True : wgpu::OptionalBool::False;
-    ds.depthCompare = c.depth_test ? compare(c.depth_test - 1) : wgpu::CompareFunction::Always;
+    s[10] = c.depth_write ? 1 : 0;
+    s[11] = static_cast<uint32_t>(c.depth_test ? compare(c.depth_test - 1) : wgpu::CompareFunction::Always);
     if (c.stencil) {
-      wgpu::StencilFaceState face{};
-      face.compare = compare(c.stencil_test & 7);
-      face.failOp = stencil_op(c.stencil_op);
-      face.depthFailOp = stencil_op(c.stencil_op >> 4);
-      face.passOp = stencil_op(c.stencil_op >> 8);
-      ds.stencilFront = ds.stencilBack = face;
-      ds.stencilReadMask = c.stencil_test >> 24 & 0xFF;
-      ds.stencilWriteMask = c.stencil_test >> 8 & 0xFF;
-    } else {
-      ds.stencilReadMask = 0;
-      ds.stencilWriteMask = 0;
+      s[12] = 1;
+      s[13] = static_cast<uint32_t>(compare(c.stencil_test & 7));
+      s[14] = static_cast<uint32_t>(stencil_op(c.stencil_op));
+      s[15] = static_cast<uint32_t>(stencil_op(c.stencil_op >> 4));
+      s[16] = static_cast<uint32_t>(stencil_op(c.stencil_op >> 8));
+      s[17] = c.stencil_test >> 24 & 0xFF;
+      s[18] = c.stencil_test >> 8 & 0xFF;
     }
-    pd.depthStencil = &ds;
+    // kept for the next runs (warm_pipelines), once
+    if (!recipes_path_.empty() && recipes_known_.insert(id).second) {
+      std::ofstream out(recipes_path_, std::ios::binary | std::ios::app);
+      put_string(out, recipe.id), put_string(out, recipe.vertex), put_string(out, recipe.fragment);
+      const uint32_t n = static_cast<uint32_t>(s.size());
+      out.write(reinterpret_cast<const char*>(&n), 4);
+      out.write(reinterpret_cast<const char*>(s.data()), n * 4);
+    }
     if (!async_) {
-      result = gpu_.device.CreateRenderPipeline(&pd);
+      Described d;
+      result = gpu_.device.CreateRenderPipeline(describe(recipe, d));
       return;
     }
     // compiled on Dawn's threads: the draws that need it wait (are skipped)
     // until it is ready, and the game goes on meanwhile
-    compiling_.insert(id);
-    futures_.push_back(gpu_.device.CreateRenderPipelineAsync(
-        &pd, wgpu::CallbackMode::WaitAnyOnly,
-        [this, id, source](wgpu::CreatePipelineAsyncStatus status, wgpu::RenderPipeline ready, wgpu::StringView message) {
-          compiling_.erase(id);
-          if (status != wgpu::CreatePipelineAsyncStatus::Success) {
-            ++stats_.shader_errors;
-            if (errors.size() < 3)
-              errors.push_back(std::string(message.data, message.length) + "\n--- WGSL ---\n" + source);
-          }
-          pipelines_[id] = std::move(ready);
-        }));
+    start_pipeline(recipe);
   });
   if (async_ && error.empty()) {
     // one the disk cache holds is ready in a few milliseconds (about 8 measured): waiting that long spares its draws
@@ -726,12 +1166,19 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
 void Renderer::record(const pica::State& state, bool indexed, const std::vector<pica::CommandProcessor::Vertex>* immediate) {
   ++stats_.draws;
   Timed timed{stats_.record};
+  // the lookup tables' buffer could not take one more set: the draws so far sent with it, then it starts over
+  // (checked here, before this draw puts anything in the submit: Koopa Cape added more sets in one submit than
+  // the buffer holds, the write overflowed and the GPU device was lost)
+  if (luts_.size() + 2 * (24 * 256 + 128) > kLutCapacity) {
+    if (!pending_.empty()) flush(false);
+    luts_.clear(), luts_known_.clear(), luts_uploaded_ = 0, last_luts_at_ = UINT32_MAX;
+  }
   const auto& r = state.regs;
   // the color and depth buffers the draw renders into
   const uint32_t dims = r[0x11E], width = dims & 0x7FF, height = (dims >> 12 & 0x3FF) + 1;
   const uint32_t color_address = (r[0x11D] & 0x0FFFFFFF) << 3, depth_address = (r[0x11C] & 0x0FFFFFFF) << 3;
-  if (width == 0 || color_address == 0 || (r[0x116] & 3) != 3) {
-    // shortcut: D24S8 depth only so far, what SM3DL uses (the color formats are all there)
+  const uint32_t depth_format = r[0x116] & 3;
+  if (width == 0 || color_address == 0 || depth_format == 1) { // 1: no such depth format
     ++stats_.skipped;
     return;
   }
@@ -855,16 +1302,29 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   }
 
   // the uniform blocks
-  d.vs_offset = static_cast<uint32_t>(uniforms_.size());
-  uniforms_.resize(uniforms_.size() + align_up(kVsUniformsSize, kUniformAlign), 0);
-  uint8_t* vsu = uniforms_.data() + d.vs_offset;
-  for (int i = 0; i < 96; ++i) std::memcpy(vsu + i * 16, state.vs.float_uniforms[i].data(), 16);
-  for (int i = 0; i < 4; ++i) std::memcpy(vsu + 96 * 16 + i * 4, state.vs.int_uniforms[i].data(), 4);
-  const uint32_t bools = state.vs.bool_uniforms;
-  std::memcpy(vsu + 96 * 16 + 16, &bools, 4);
-  d.draw_offset = static_cast<uint32_t>(uniforms_.size());
-  uniforms_.resize(uniforms_.size() + align_up(sizeof du, kUniformAlign), 0);
-  std::memcpy(uniforms_.data() + d.draw_offset, &du, sizeof du);
+  // the uniform blocks; one the same as the last draw's is that one again (consecutive draws often share
+  // all their constants): less to copy and to send
+  {
+    uint8_t vsu[kVsUniformsSize] = {};
+    for (int i = 0; i < 96; ++i) std::memcpy(vsu + i * 16, state.vs.float_uniforms[i].data(), 16);
+    for (int i = 0; i < 4; ++i) std::memcpy(vsu + 96 * 16 + i * 4, state.vs.int_uniforms[i].data(), 4);
+    const uint32_t bools = state.vs.bool_uniforms;
+    std::memcpy(vsu + 96 * 16 + 16, &bools, 4);
+    if (last_vs_offset_ != UINT32_MAX && std::memcmp(uniforms_.data() + last_vs_offset_, vsu, sizeof vsu) == 0) {
+      d.vs_offset = last_vs_offset_;
+    } else {
+      d.vs_offset = last_vs_offset_ = static_cast<uint32_t>(uniforms_.size());
+      uniforms_.resize(uniforms_.size() + align_up(kVsUniformsSize, kUniformAlign), 0);
+      std::memcpy(uniforms_.data() + d.vs_offset, vsu, sizeof vsu);
+    }
+  }
+  if (last_draw_offset_ != UINT32_MAX && std::memcmp(uniforms_.data() + last_draw_offset_, &du, sizeof du) == 0) {
+    d.draw_offset = last_draw_offset_;
+  } else {
+    d.draw_offset = last_draw_offset_ = static_cast<uint32_t>(uniforms_.size());
+    uniforms_.resize(uniforms_.size() + align_up(sizeof du, kUniformAlign), 0);
+    std::memcpy(uniforms_.data() + d.draw_offset, &du, sizeof du);
+  }
 
   d.pipeline = pipeline(config, state.vs);
   if (!d.pipeline) {
@@ -875,12 +1335,13 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   // only when written back (shortcut: the console blends what the format kept)
   Surface& color = surface(color_address, width, height, false,
                            static_cast<uint32_t>(color_buffer_format(r[0x117] >> 16 & 7)));
-  Surface& depth = surface(depth_address, width, height, true);
+  Surface& depth = surface(depth_address, width, height, true, depth_format);
   load(color);
   load(depth);
-  if (!color.drawn) forget_textures(color.address, color.bytes());
-  if (!depth.drawn) forget_textures(depth.address, depth.bytes());
+  if (!color.drawn) forget_textures(color.address, color.bytes()), remember(color);
+  if (!depth.drawn) forget_textures(depth.address, depth.bytes()), remember(depth);
   color.drawn = depth.drawn = true;
+  ++color.version, ++depth.version;
   d.color = &color;
   d.depth = &depth;
   pending_.push_back(d);
@@ -898,9 +1359,28 @@ void Renderer::submit(const std::vector<Surface*>& back) {
   if (pending_.empty() && back.empty()) return;
   ++stats_.flushes;
   auto encode_start = std::chrono::steady_clock::now();
-  const wgpu::Buffer arena = make_buffer(gpu_, arena_.data(), arena_.size(), wgpu::BufferUsage::Storage);
-  const wgpu::Buffer luts = make_buffer(gpu_, luts_.data(), luts_.size() * 4, wgpu::BufferUsage::Storage);
-  const wgpu::Buffer uniforms = make_buffer(gpu_, uniforms_.data(), uniforms_.size(), wgpu::BufferUsage::Uniform);
+  // the lookup tables stay on the GPU from one submit to the next: sent again only when some were added
+  const size_t added_luts = luts_.size() - std::min(luts_uploaded_, luts_.size());
+  stats_.submit_bytes += arena_.size() + added_luts * 4 + uniforms_.size();
+  stats_.arena_bytes += arena_.size(), stats_.lut_bytes += added_luts * 4;
+  wgpu::Buffer arena, luts, uniforms;
+  {
+    Timed t{stats_.submit_buffers};
+    arena = make_buffer(gpu_, arena_.data(), arena_.size(), wgpu::BufferUsage::Storage);
+    if (!luts_buffer_) {
+      wgpu::BufferDescriptor bd{};
+      bd.size = kLutCapacity * 4;
+      bd.usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+      luts_buffer_ = gpu_.device.CreateBuffer(&bd);
+      luts_uploaded_ = 0;
+    }
+    if (added_luts)
+      gpu_.queue.WriteBuffer(luts_buffer_, luts_uploaded_ * 4, luts_.data() + luts_uploaded_, added_luts * 4);
+    luts_uploaded_ = luts_.size();
+    luts = luts_buffer_;
+    uniforms = make_buffer(gpu_, uniforms_.data(), uniforms_.size(), wgpu::BufferUsage::Uniform);
+  }
+  const auto draws_start = std::chrono::steady_clock::now();
   const wgpu::CommandEncoder encoder = gpu_.device.CreateCommandEncoder();
 
   wgpu::RenderPassEncoder pass;
@@ -955,10 +1435,12 @@ void Renderer::submit(const std::vector<Surface*>& back) {
     buffers = gpu_.device.CreateBindGroup(&bd);
   };
 
+  const PendingDraw* last = nullptr; // the last draw encoded in the current pass
   for (const PendingDraw& d : pending_) {
     if (d.clear) {
       // a fill over the whole surface, done on the GPU
-      end_pass();
+      stats_.submit_draws += std::chrono::duration<double>(std::chrono::steady_clock::now() - draws_start).count();
+  end_pass();
       wgpu::RenderPassColorAttachment ca{};
       wgpu::RenderPassDepthStencilAttachment da{};
       wgpu::RenderPassDescriptor rp{};
@@ -1002,17 +1484,30 @@ void Renderer::submit(const std::vector<Surface*>& back) {
       end_pass();
       continue;
     }
-    if (!pass || pass_depth_only || pass_color != d.color || pass_depth != d.depth) begin_pass(d.color, d.depth);
-    const uint32_t offsets[2] = {d.vs_offset, d.draw_offset};
-    pass.SetPipeline(d.pipeline);
+    if (!pass || pass_depth_only || pass_color != d.color || pass_depth != d.depth) {
+      begin_pass(d.color, d.depth);
+      last = nullptr; // a new pass has no state yet
+    }
+    // what changed since the last draw of this pass, and only that (Dawn checks every call)
+    if (!last || last->pipeline.Get() != d.pipeline.Get()) pass.SetPipeline(d.pipeline);
     if (!buffers) make_buffers();
-    pass.SetBindGroup(0, buffers, 2, offsets);
-    pass.SetBindGroup(1, texture_group(d.views, d.samplers));
-    pass.SetScissorRect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
-    pass.SetStencilReference(d.stencil_reference);
-    const wgpu::Color constant{d.blend_constant[0], d.blend_constant[1], d.blend_constant[2], d.blend_constant[3]};
-    pass.SetBlendConstant(&constant);
+    if (!last || last->vs_offset != d.vs_offset || last->draw_offset != d.draw_offset) {
+      const uint32_t offsets[2] = {d.vs_offset, d.draw_offset};
+      pass.SetBindGroup(0, buffers, 2, offsets);
+    }
+    bool same_textures = last != nullptr;
+    for (int u = 0; u < 3 && same_textures; ++u)
+      same_textures = last->views[u].Get() == d.views[u].Get() && last->samplers[u].Get() == d.samplers[u].Get();
+    if (!same_textures) pass.SetBindGroup(1, texture_group(d.views, d.samplers));
+    if (!last || std::memcmp(last->scissor, d.scissor, sizeof d.scissor))
+      pass.SetScissorRect(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
+    if (!last || last->stencil_reference != d.stencil_reference) pass.SetStencilReference(d.stencil_reference);
+    if (!last || std::memcmp(last->blend_constant, d.blend_constant, sizeof d.blend_constant)) {
+      const wgpu::Color constant{d.blend_constant[0], d.blend_constant[1], d.blend_constant[2], d.blend_constant[3]};
+      pass.SetBlendConstant(&constant);
+    }
     pass.Draw(d.vertex_count);
+    last = &d;
   }
   end_pass();
 
@@ -1068,13 +1563,18 @@ void Renderer::submit(const std::vector<Surface*>& back) {
     store(*rb.surface, std::vector<uint8_t>(bytes, bytes + rb.size));
     rb.buffer.Unmap();
     rb.surface->drawn = false;
+    if (rb.surface->pending && on_pending) rb.surface->pending = false, on_pending(rb.surface->address, rb.surface->bytes(), false);
   }
 
   pending_.clear();
   arena_.clear();
-  luts_.clear();
+  // the tables are kept (and their place, last_luts_at_) unless they grew large
+  // full: start over (the tables are added again as draws need them)
+  if (luts_.size() + 2 * (24 * 256 + 128) > kLutCapacity)
+    luts_.clear(), luts_known_.clear(), luts_uploaded_ = 0, last_luts_at_ = UINT32_MAX;
   uniforms_.clear();
-  last_luts_at_ = UINT32_MAX;
+  last_vs_offset_ = last_draw_offset_ = UINT32_MAX;
+  arena_known_.clear();
 }
 
 void Renderer::write_back(uint32_t address, uint32_t size, bool forget) {
@@ -1126,23 +1626,26 @@ uint32_t copy_span(uint32_t size, uint32_t gap) {
 void Renderer::memory_fill(uint32_t start, uint32_t end, uint32_t value, uint32_t width) {
   if (end <= start) return;
   deliver(start, end - start);
-  if (cached_ && width == 4) {
-    // a whole surface: cleared on the GPU, memory gets it if anything reads it
+  if (cached_) {
+    // a whole surface filled with pixels of its own size: cleared on the GPU, memory gets it if anything reads it
     for (auto& [key, s] : surfaces_) {
-      if (s->address != start || start + s->bytes() != end || (!s->depth && s->format != ColorFormat::RGBA8)) continue;
+      if (s->address != start || start + s->bytes() != end || s->pixel_bytes() != width) continue;
       PendingDraw clear{};
       clear.clear = true;
       if (s->depth) {
         clear.depth = s.get();
-        clear.clear_color[0] = static_cast<double>(value & 0xFFFFFF) / 16777215.0;
-        clear.stencil_reference = value >> 24;
+        clear.clear_color[0] = width == 2 ? static_cast<double>(value & 0xFFFF) / 65535.0
+                                          : static_cast<double>(value & 0xFFFFFF) / 16777215.0;
+        clear.stencil_reference = width == 4 ? value >> 24 : 0;
       } else {
         clear.color = s.get();
-        const Rgba c = decode(ColorFormat::RGBA8, reinterpret_cast<const uint8_t*>(&value));
+        const Rgba c = decode(s->format, reinterpret_cast<const uint8_t*>(&value));
         for (int k = 0; k < 4; ++k) clear.clear_color[k] = c[k] / 255.0;
       }
       pending_.push_back(clear);
+      if (!s->drawn) remember(*s);
       s->loaded = s->drawn = true;
+      ++s->version;
       forget_textures(start, end - start);
       return;
     }
@@ -1156,6 +1659,13 @@ void Renderer::display_transfer(uint32_t input, uint32_t output, uint32_t input_
                                 uint32_t output_dimensions, uint32_t flags) {
   uint32_t input_bytes, output_bytes;
   transfer_ranges(input_dimensions, output_dimensions, flags, input_bytes, output_bytes);
+  // tiled to tiled (a picture made smaller for an effect, then read as a texture): done on the GPU into a color
+  // buffer there, its memory written only if the CPU reads it (PN_NO_TILED_TRANSFER=1: not)
+  static const bool tiled_on_gpu = std::getenv("PN_NO_TILED_TRANSFER") == nullptr;
+  if (cached_ && tiled_on_gpu && gpu_tiled_transfer(input, output, input_dimensions, output_dimensions, flags)) {
+    forget_textures(output, output_bytes);
+    return;
+  }
   if (cached_) {
     write_back(output, output_bytes, true);
     forget_textures(output, output_bytes);
@@ -1183,6 +1693,135 @@ void Renderer::display_transfer(uint32_t input, uint32_t output, uint32_t input_
   forget_textures(output, output_bytes);
 }
 
+wgpu::TextureView Renderer::depth_as_color(Surface& s) {
+  if (s.as_color && s.as_color_version == s.version) return s.as_color_view;
+  if (!depth_color_pipeline_) {
+    static const char* source = R"(
+@group(0) @binding(0) var depth: texture_depth_2d;
+@group(0) @binding(1) var stencil: texture_2d<u32>;
+@group(0) @binding(2) var dst: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let size = textureDimensions(dst);
+  if (id.x >= size.x || id.y >= size.y) { return; }
+  let p = vec2<u32>(id.xy);
+  // as Renderer::store writes it: 24 bits of depth, the stencil above; an RGBA8 texel reads that word's
+  // bytes 3, 2, 1, 0 as red, green, blue, alpha
+  let d = u32(clamp(textureLoad(depth, p, 0), 0.0, 1.0) * 16777215.0);
+  let st = textureLoad(stencil, p, 0).r & 0xFFu;
+  textureStore(dst, p, vec4<f32>(f32(st), f32((d >> 16u) & 0xFFu), f32((d >> 8u) & 0xFFu), f32(d & 0xFFu)) / 255.0);
+}
+)";
+    wgpu::ComputePipelineDescriptor cd{};
+    cd.compute.module = module(gpu_, source);
+    cd.compute.entryPoint = "main";
+    depth_color_pipeline_ = gpu_.device.CreateComputePipeline(&cd);
+  }
+  if (!s.as_color) {
+    wgpu::TextureDescriptor td{};
+    td.size = {s.width * scale_, s.height * scale_, 1};
+    td.format = wgpu::TextureFormat::RGBA8Unorm;
+    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::StorageBinding;
+    s.as_color = gpu_.device.CreateTexture(&td);
+    s.as_color_view = s.as_color.CreateView();
+  }
+  submit({}); // the draws into the depth buffer first
+  wgpu::TextureViewDescriptor depth_view{}, stencil_view{};
+  depth_view.aspect = wgpu::TextureAspect::DepthOnly;
+  stencil_view.aspect = wgpu::TextureAspect::StencilOnly;
+  wgpu::BindGroupEntry e[3] = {};
+  e[0].binding = 0, e[0].textureView = s.texture.CreateView(&depth_view);
+  e[1].binding = 1, e[1].textureView = s.texture.CreateView(&stencil_view);
+  e[2].binding = 2, e[2].textureView = s.as_color_view;
+  wgpu::BindGroupDescriptor group{};
+  group.layout = depth_color_pipeline_.GetBindGroupLayout(0);
+  group.entryCount = 3;
+  group.entries = e;
+  const wgpu::CommandEncoder encoder = gpu_.device.CreateCommandEncoder();
+  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+  pass.SetPipeline(depth_color_pipeline_);
+  pass.SetBindGroup(0, gpu_.device.CreateBindGroup(&group));
+  pass.DispatchWorkgroups((s.width * scale_ + 7) / 8, (s.height * scale_ + 7) / 8);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  gpu_.queue.Submit(1, &commands);
+  s.as_color_version = s.version;
+  return s.as_color_view;
+}
+
+bool Renderer::gpu_tiled_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions,
+                                  uint32_t output_dimensions, uint32_t flags) {
+  const uint32_t width = input_dimensions & 0xFFFF, height = input_dimensions >> 16;
+  const uint32_t out_width = output_dimensions & 0xFFFF, out_height = output_dimensions >> 16;
+  const bool flip = flags & 1, input_linear = flags & 2;
+  const bool output_tiled = input_linear != ((flags & 0x20) != 0);
+  const uint32_t downscale = flags >> 24 & 3;
+  if (input_linear || !output_tiled || flip || downscale == 3) return false;
+  const uint32_t sx = downscale ? 2 : 1, sy = downscale == 2 ? 2 : 1;
+  const uint32_t copy_width = out_width / sx, copy_height = out_height / sy;
+  if (copy_width == 0 || copy_height == 0 || copy_width * sx > width || copy_height * sy > height) return false;
+  if (copy_width % 8 || copy_height % 8) return false; // whole tiles only
+  const ColorFormat input_format = transfer_format(flags >> 8), output_format = transfer_format(flags >> 12);
+  Surface* in = nullptr;
+  for (auto& [key, c] : surfaces_)
+    if (!c->depth && c->address == input && c->width == width && c->format == input_format && c->loaded &&
+        c->height >= copy_height * sy) {
+      in = c.get();
+      break;
+    }
+  if (!in) return false;
+  Surface& out = surface(output, copy_width, copy_height, false, static_cast<uint32_t>(output_format));
+  if (&out == in) return false;
+  if (!tiled_pipeline_) {
+    static const char* source = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var dst: texture_storage_2d<rgba8unorm, write>;
+struct P { w: u32, h: u32, sx: u32, sy: u32 };
+@group(0) @binding(2) var<uniform> p: P;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x >= p.w || id.y >= p.h) { return; }
+  var sum = vec4<f32>(0.0);
+  for (var j = 0u; j < p.sy; j++) {
+    for (var i = 0u; i < p.sx; i++) {
+      sum += textureLoad(src, vec2<u32>(id.x * p.sx + i, id.y * p.sy + j), 0);
+    }
+  }
+  textureStore(dst, vec2<u32>(id.x, id.y), sum / f32(p.sx * p.sy));
+}
+)";
+    wgpu::ComputePipelineDescriptor cd{};
+    cd.compute.module = module(gpu_, source);
+    cd.compute.entryPoint = "main";
+    tiled_pipeline_ = gpu_.device.CreateComputePipeline(&cd);
+  }
+  submit({}); // the draws into the input first
+  // the output's pixels at the scale: each the average of sx by sy of the input's at the scale
+  const uint32_t parameters[4] = {copy_width * scale_, copy_height * scale_, sx, sy};
+  const wgpu::Buffer uniform = make_buffer(gpu_, parameters, sizeof parameters, wgpu::BufferUsage::Uniform);
+  if (!in->view) in->view = in->texture.CreateView();
+  if (!out.view) out.view = out.texture.CreateView();
+  wgpu::BindGroupEntry e[3] = {};
+  e[0].binding = 0, e[0].textureView = in->view;
+  e[1].binding = 1, e[1].textureView = out.view;
+  e[2].binding = 2, e[2].buffer = uniform, e[2].size = sizeof parameters;
+  wgpu::BindGroupDescriptor group{};
+  group.layout = tiled_pipeline_.GetBindGroupLayout(0);
+  group.entryCount = 3;
+  group.entries = e;
+  const wgpu::CommandEncoder encoder = gpu_.device.CreateCommandEncoder();
+  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+  pass.SetPipeline(tiled_pipeline_);
+  pass.SetBindGroup(0, gpu_.device.CreateBindGroup(&group));
+  pass.DispatchWorkgroups((copy_width * scale_ + 7) / 8, (copy_height * scale_ + 7) / 8);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  gpu_.queue.Submit(1, &commands);
+  ++stats_.gpu_tiled_transfers;
+  // the whole output is the GPU's now: memory gets it when read
+  if (!out.drawn) remember(out);
+  out.loaded = out.drawn = true;
+  return true;
+}
+
 bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions,
                             uint32_t output_dimensions, uint32_t flags) {
   // the case games use to show a frame: a color buffer the GPU holds, out to
@@ -1191,30 +1830,47 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   const uint32_t out_width = output_dimensions & 0xFFFF, out_height = output_dimensions >> 16;
   const bool flip = flags & 1, input_linear = flags & 2;
   const bool output_tiled = input_linear != ((flags & 0x20) != 0);
-  if (input_linear || output_tiled || (flags >> 24 & 3) != 0 || transfer_format(flags >> 8) != ColorFormat::RGBA8)
-    return false;
-  // as wide: a crop only drops lines, and never moves the output (transfer.cpp)
-  if (out_width != width || out_height > height || out_width == 0 || out_height == 0) return false;
+  // any color format: the surface's GPU texture is RGBA8 whatever memory holds, the shader stores it as memory would
+  const ColorFormat input_format = transfer_format(flags >> 8);
+  const uint32_t downscale = flags >> 24 & 3;
+  if (input_linear || output_tiled || downscale == 3) return false;
+  // the output dimensions count input pixels: a downscale divides them (transfer.cpp)
+  const uint32_t sx = downscale == 1 || downscale == 2 ? 2 : 1, sy = downscale == 2 ? 2 : 1;
+  const uint32_t copy_width = out_width / sx, copy_height = out_height / sy;
+  // the whole output written: a narrower output keeps the first pixels of each line (a crop), but a flipped crop
+  // moves the output (transfer.cpp), and what an output larger than the input leaves alone stays transfer.cpp's
+  if (copy_width == 0 || copy_height == 0 || copy_width * sx > width || copy_height * sy > height) return false;
+  if (flip && (flags & 4) && width > out_width) return false;
   // a color surface as wide holding the lines read: from its start, or from a
   // line of tiles down (a game drawing both screens into one buffer)
   Surface* found = nullptr;
   uint32_t first = 0;
   for (auto& [key, candidate] : surfaces_) {
-    const uint32_t tile_line = width * 8 * 4;
-    if (candidate->depth || candidate->format != ColorFormat::RGBA8 || candidate->width != width || !candidate->loaded ||
+    const uint32_t tile_line = width * 8 * bytes_per_pixel(input_format);
+    if (candidate->depth || candidate->format != input_format || candidate->width != width || !candidate->loaded ||
         input < candidate->address ||
         (input - candidate->address) % tile_line != 0)
       continue;
     const uint32_t line = (input - candidate->address) / tile_line * 8;
-    if (line + out_height > candidate->height) continue;
+    if (line + copy_height * sy > candidate->height) continue;
     found = candidate.get(), first = line;
     break;
   }
-  if (!found) return false;
+  if (!found) {
+    static int said = 0; // DEBUG-TRANSFER
+    const char* debug = std::getenv("PN_DEBUG_TRANSFER");
+    if (debug && said++ >= std::atoi(debug) && said < std::atoi(debug) + 6) {
+      std::fprintf(stderr, "[pn] no surface for transfer %08x %ux%u fmt %d:", input, width, height, int(input_format));
+      for (auto& [key, c] : surfaces_)
+        if (!c->depth) std::fprintf(stderr, " [%08x %ux%u fmt %d %s]", c->address, c->width, c->height, int(c->format), c->loaded ? "loaded" : "-");
+      std::fprintf(stderr, "\n");
+    }
+    return false;
+  }
   Surface& s = *found;
 
   const ColorFormat format = transfer_format(flags >> 12);
-  const uint32_t bpp = bytes_per_pixel(format), bytes = out_width * out_height * bpp;
+  const uint32_t bpp = bytes_per_pixel(format), bytes = copy_width * copy_height * bpp;
   const uint32_t words = (bytes + 3) / 4;
 
   submit({}); // the draws into the surface first
@@ -1224,7 +1880,11 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
   const wgpu::Buffer out = gpu_.device.CreateBuffer(&bd);
   bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
   const wgpu::Buffer back = gpu_.device.CreateBuffer(&bd);
-  const uint32_t parameters[4] = {out_width, out_height, static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8 | first << 16 | scale_ << 26, words};
+  const uint32_t parameters[4] = {copy_width, copy_height,
+                                  static_cast<uint32_t>(format) | (flip ? 1u : 0u) << 8 |
+                                      static_cast<uint32_t>(input_format) << 9 | (sx - 1) << 12 | (sy - 1) << 13 |
+                                      first << 16 | scale_ << 26,
+                                  words};
   const wgpu::Buffer uniform = make_buffer(gpu_, parameters, sizeof parameters, wgpu::BufferUsage::Uniform);
   const wgpu::TextureView view = s.texture.CreateView();
   wgpu::BindGroupEntry e[3] = {};
@@ -1249,9 +1909,9 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
 
   // write_back(output) delivered what overlapped: deliveries never overlap
   wgpu::TextureView scaled;
-  if (scale_ > 1) { // what the window shows: the lines transferred, at the scale
+  if (scale_ > 1) { // what the window shows: the pixels transferred, at the scale (its filter averages a downscale)
     wgpu::TextureDescriptor td{};
-    td.size = {width * scale_, out_height * scale_, 1};
+    td.size = {copy_width * sx * scale_, copy_height * sy * scale_, 1};
     td.format = wgpu::TextureFormat::RGBA8Unorm;
     td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst;
     const wgpu::Texture copy = gpu_.device.CreateTexture(&td);
@@ -1266,9 +1926,13 @@ bool Renderer::gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dime
     scaled = copy.CreateView();
   }
   pictures_.push_back({output, bytes, out, scaled, flip});
+  std::vector<uint8_t> before;
+  if (const uint8_t* now = memory_.map(output, bytes)) before.assign(now, now + bytes);
   deliveries_.push_back({output, bytes, back,
                          back.MapAsync(wgpu::MapMode::Read, 0, bd.size, wgpu::CallbackMode::WaitAnyOnly,
-                                       [](wgpu::MapAsyncStatus, wgpu::StringView) {})});
+                                       [](wgpu::MapAsyncStatus, wgpu::StringView) {}),
+                         std::move(before)});
+  if (on_pending) on_pending(output, bytes, true);
   // shortcut: a host that never reads its pictures back keeps up to 16 on the way
   if (deliveries_.size() > 16) deliver(deliveries_.front().address, 1);
   return true;
@@ -1299,13 +1963,22 @@ void Renderer::deliver(uint32_t address, uint32_t size) {
     Timed waited{stats_.wait};
     gpu_.instance.WaitAny(d.mapped, UINT64_MAX);
     if (const auto* bytes = static_cast<const uint8_t*>(d.buffer.GetConstMappedRange(0, (d.size + 3) & ~3u))) {
-      if (uint8_t* to = memory_.map(d.address, d.size)) std::memcpy(to, bytes, d.size);
-      else
+      if (uint8_t* to = memory_.map(d.address, d.size)) {
+        // the console's engine wrote when the transfer ran: what the game wrote there since is newer, kept
+        if (d.before.size() != d.size || std::memcmp(to, d.before.data(), d.size) == 0) std::memcpy(to, bytes, d.size);
+        else {
+          ++stats_.stores_merged;
+          for (uint32_t k = 0; k < d.size; ++k)
+            if (to[k] == d.before[k]) to[k] = bytes[k];
+        }
+      } else
         for (uint32_t k = 0; k < d.size; ++k)
           if (uint8_t* b = memory_.map(d.address + k, 1)) *b = bytes[k];
     }
     d.buffer.Unmap();
+    const uint32_t done_address = d.address, done_size = d.size;
     deliveries_.erase(deliveries_.begin() + static_cast<std::ptrdiff_t>(i));
+    if (on_pending) on_pending(done_address, done_size, false);
   }
 }
 

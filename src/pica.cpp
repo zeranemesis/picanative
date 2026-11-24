@@ -1,5 +1,9 @@
 #include "picanative/pica.hpp"
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+
 #include <bit>
 #include <cstring>
 #include <vector>
@@ -35,6 +39,7 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     if (const uint8_t* data = memory_.map(at, bytes / 4 * 4)) std::memcpy(words.data(), data, bytes / 4 * 4);
   };
   load(address, size);
+  uint32_t base = address; // the list the words come from, for the statistics
   uint32_t jumps = 0;
   jump_ = false;
   size_t i = 0;
@@ -47,6 +52,20 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     const bool consecutive = header >> 31;
     if (reg >= kRegisterCount) break; // not a command: the list is over
     const size_t available = std::min<size_t>(extra, words.size() - i);
+    if (reg == kRegNativeSkip) { // a host's padding where a block was: its words are not read
+      i += available;
+      if (extra % 2) ++i;
+      i = std::min(i, words.size());
+      continue;
+    }
+    words_by_register[reg] += 1 + available;
+    if (reg == 0x200) ++attribute_lists[base];
+    // PN_DUMP_LIST=n: the commands the n-th command list (and its jumps) still has, to stderr
+    static const long dump_at = std::getenv("PN_DUMP_LIST") ? std::atol(std::getenv("PN_DUMP_LIST")) : -1;
+    if (dump_at >= 0 && static_cast<long>(command_lists) >= dump_at && static_cast<long>(command_lists) < dump_at + 12 &&
+        reg != kRegNativeOperation)
+      std::fprintf(stderr, "[dump] %08x +%04zx  %03x mask %x x%zu  %08x\n", base, (i - 2) * 4, reg, mask,
+                   available + 1, first);
     write(reg, first, mask);
     for (size_t k = 0; k < available; ++k) write(consecutive ? reg + 1 + static_cast<uint32_t>(k) : reg, words[i + k], mask);
     i += available;
@@ -55,12 +74,34 @@ void CommandProcessor::run(uint32_t address, uint32_t size) {
     if (jump_) {
       jump_ = false;
       if (++jumps > 0x10000) break;
+      jump_words += jump_size_ / 4;
+      base = jump_address_;
+      ++jump_targets[jump_address_];
       load(jump_address_, jump_size_);
       i = 0;
     }
   }
   flush_immediate();
   ++command_lists;
+}
+
+void CommandProcessor::print_register_stats() const {
+  // PN_REG_STATS: which registers the command lists wrote, by words (what a host doing libraries natively has left)
+  if (!std::getenv("PN_REG_STATS")) return;
+  uint64_t total = 0;
+  std::vector<std::pair<uint64_t, uint32_t>> rows;
+  for (uint32_t r = 0; r < kRegisterCount; ++r)
+    if (words_by_register[r]) total += words_by_register[r], rows.emplace_back(words_by_register[r], r);
+  std::sort(rows.rbegin(), rows.rend());
+  std::fprintf(stderr, "[picanative] %llu command words by register; %llu read through jumps, to %zu places:\n",
+               static_cast<unsigned long long>(total), static_cast<unsigned long long>(jump_words), jump_targets.size());
+  for (size_t i = 0; i < rows.size() && i < 40; ++i)
+    std::fprintf(stderr, "[picanative]   %03x %6.2f %%\n", rows[i].second, 100.0 * rows[i].first / total);
+  for (const auto& [address, n] : attribute_lists)
+    std::fprintf(stderr, "[picanative]   0x200 written by the list at %08x: %llu times\n", address,
+                 static_cast<unsigned long long>(n));
+  for (const auto& [address, n] : jump_targets)
+    std::fprintf(stderr, "[picanative]   jump to %08x: %llu times\n", address, static_cast<unsigned long long>(n));
 }
 
 void CommandProcessor::flush_immediate() {
@@ -81,7 +122,9 @@ void CommandProcessor::write(uint32_t reg, uint32_t value, uint32_t mask) {
   const uint32_t merged = (regs[reg] & ~bits) | (value & bits);
   regs[reg] = merged;
 
-  if (reg == kRegDrawArrays || reg == kRegDrawElements) {
+  if (reg == kRegNativeOperation) {
+    if (on_native) on_native(merged);
+  } else if (reg == kRegDrawArrays || reg == kRegDrawElements) {
     ++draws;
     if (on_draw) on_draw(state_, reg == kRegDrawElements);
   } else if (reg == kRegCmdBufJump0 || reg == kRegCmdBufJump1) {
@@ -170,6 +213,34 @@ void CommandProcessor::configure(ShaderUnit& unit, uint32_t offset, uint32_t val
       unit.key_stale |= unit.descriptors[unit.descriptor_cursor] != value;
       unit.descriptors[unit.descriptor_cursor++] = value;
     }
+  }
+}
+
+void CommandProcessor::run_program(const uint32_t* w, size_t n) {
+  for (size_t i = 0; i < n;) {
+    const uint32_t step = w[i];
+    if ((step >> 30) == 3) { // one register, many values (uniform data, program code, a table)
+      const uint32_t reg = step & 0xFFFF, mask = step >> 16 & 0xF, count = i + 1 < n ? w[i + 1] : 0;
+      for (uint32_t k = 0; k < count && i + 2 + k < n; ++k) write(reg, w[i + 2 + k], mask);
+      i += 2 + count;
+    } else if (step >> 31) { // float uniforms, vertex or geometry
+      const uint32_t first = step >> 8 & 0x7F, rows = step & 0xFF;
+      if (i + 1 + rows * 4 <= n) vertex_uniforms(first, w + i + 1, rows, (step >> 15 & 1) != 0);
+      i += 1 + rows * 4;
+    } else { // a register
+      if (i + 1 < n) write(step & 0xFFFF, w[i + 1], step >> 16 & 0xF);
+      i += 2;
+    }
+  }
+}
+
+void CommandProcessor::vertex_uniforms(uint32_t first, const uint32_t* words, uint32_t count, bool geometry) {
+  if (!immediate_.empty()) flush_immediate();
+  ShaderUnit& unit = geometry ? state_.gs : state_.vs;
+  for (uint32_t i = 0; i < count && first + i < kFloatUniforms; ++i) {
+    const uint32_t* w = words + i * 4;
+    unit.float_uniforms[first + i] = {std::bit_cast<float>(w[3]), std::bit_cast<float>(w[2]),
+                                      std::bit_cast<float>(w[1]), std::bit_cast<float>(w[0])};
   }
 }
 

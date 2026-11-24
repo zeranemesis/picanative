@@ -103,10 +103,13 @@ bool create(Context& context, std::string& error, wgpu::BackendType backend) {
   wgpu::DawnCacheDeviceDescriptor cache{};
   cache.loadDataFunction = load_cached;
   cache.storeDataFunction = store_cached;
-  const std::array toggles{"use_dxc", "disable_robustness", "disable_symbol_renaming"};
+  // skip_validation: Dawn checks every call (most of the time spent encoding draws); the engine's calls are
+  // checked when PN_VALIDATE is set (to look for a mistake), not in a game
+  const bool validate = std::getenv("PN_VALIDATE") != nullptr;
+  const std::array toggles{"use_dxc", "disable_robustness", "disable_symbol_renaming", "skip_validation"};
   wgpu::DawnTogglesDescriptor toggles_descriptor{};
   toggles_descriptor.nextInChain = &cache;
-  toggles_descriptor.enabledToggleCount = toggles.size();
+  toggles_descriptor.enabledToggleCount = validate ? toggles.size() - 1 : toggles.size();
   toggles_descriptor.enabledToggles = toggles.data();
   wgpu::DeviceDescriptor device_descriptor{};
   device_descriptor.nextInChain = &toggles_descriptor;

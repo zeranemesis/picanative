@@ -43,6 +43,29 @@ PN_API void pn_texture_copy(pn_engine* engine, uint32_t input, uint32_t output, 
    CPU wrote is what the GPU reads next */
 PN_API void pn_sync_for_cpu(pn_engine* engine, uint32_t address, uint32_t size);
 PN_API void pn_cpu_wrote(pn_engine* engine, uint32_t address, uint32_t size);
+/* memory drawn into on the GPU and not in memory yet (pending 1), then written there (0): the console's GPU writes
+   at once, so a host that sees the CPU write there first calls pn_cpu_wrote (with surfaces cached) */
+typedef void (*pn_pending_fn)(void* user, uint32_t address, uint32_t size, int pending);
+PN_API void pn_set_pending_hook(pn_engine* engine, pn_pending_fn hook, void* user);
+
+/* a host that does a game's graphics library natively puts marks in the game's command lists in place of the
+   commands the library made (register 0x2F0, which the PICA200 has not): each one met calls this, in the list's
+   order, with the mark's value, the host's own operation to run there */
+typedef void (*pn_native_fn)(void* user, uint32_t operation);
+PN_API void pn_set_native_operations(pn_engine* engine, pn_native_fn run, void* user);
+/* what a native operation sets, in place of commands: a register (a draw register draws, with the state as it is);
+   vertex shader float uniforms from `first`, four 32-bit floats each, w first as a command list carries them */
+PN_API void pn_write_register(pn_engine* engine, uint32_t reg, uint32_t value, uint32_t mask);
+/* a whole native operation in one call: steps of
+     reg | mask << 16, value                                  a register
+     0x80000000 | geometry << 15 | first << 8 | rows, 4 words a row (w first)   float uniforms
+     0xC0000000 | mask << 16 | reg, count, count values       one register written count times */
+PN_API void pn_run_program(pn_engine* engine, const uint32_t* words, uint32_t count);
+/* PN_REG_STATS set: the command words written so far, by register, to stderr */
+PN_API void pn_print_register_stats(pn_engine* engine);
+PN_API void pn_vertex_uniforms(pn_engine* engine, uint32_t first, const uint32_t* words, uint32_t count);
+/* the same for the geometry shader */
+PN_API void pn_geometry_uniforms(pn_engine* engine, uint32_t first, const uint32_t* words, uint32_t count);
 
 /* how far the engine may trust the host: PN_CACHE_SURFACES keeps what it
    draws on the GPU (the host routes every fill, transfer and copy through
@@ -60,12 +83,28 @@ PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* 
    always gets the console's pixels; the window shows the scaled pictures. */
 PN_API void pn_set_resolution_scale(pn_engine* engine, uint32_t scale);
 
+/* Vertex programs translated ahead of time (by pn_shaders, from the game's
+   shader binaries): loaded before the first command list, they are not
+   translated while the game runs. 0 with the reason in error, for a missing
+   file or one another build of picanative made. */
+PN_API int pn_load_shaders(pn_engine* engine, const char* path, char* error, uint32_t error_size);
+/* the pipelines the game made in its earlier runs, kept in this file, made again now on Dawn's threads (from its
+   disk cache); the new ones are added to it. Returns how many were started. */
+PN_API uint32_t pn_warm_pipelines(pn_engine* engine, const char* path);
+/* to stdout: pipelines made ahead, textures read from color buffers on the GPU, write-backs merged */
+PN_API void pn_print_stats(pn_engine* engine);
+/* vertex programs loaded ahead, translated while running (each logged), and
+   the microseconds those translations took */
+PN_API void pn_shader_stats(pn_engine* engine, uint64_t out[3]);
+
 /* counters, for a status line: draws, pipelines, shader errors */
 PN_API void pn_stats(pn_engine* engine, uint64_t out[3]);
 /* where the engine's time went, in seconds: recording draws (of which
    textures, then pipelines), encoding, waiting for the GPU (of which storing
    to memory), loading from memory */
 PN_API void pn_times(pn_engine* engine, double out[7]);
+/* of the textures' time: write-backs, known ones found, hashing, decoding (seconds); calls */
+PN_API void pn_texture_times(pn_engine* engine, double out[4], uint64_t calls[4]); /* lookups, decodes, submits, passes */
 
 /* The port's window (built with SDL3): both screens drawn by the engine's
    device, the player's inputs, the console's sound. */
@@ -76,6 +115,7 @@ typedef struct pn_window pn_window;
    the bytes from one column to the next (0: 240 pixels' worth) */
 typedef struct pn_screen {
   uint32_t address, format, stride;
+  uint32_t right; /* the right eye's framebuffer, when the game draws one (3D): 0 or the same otherwise */
 } pn_screen;
 
 /* the buttons as the console's HID reports them */
@@ -125,6 +165,18 @@ PN_API void pn_window_set_vsync(pn_window* window, int on);
 #define PN_LAYOUT_LARGE_TOP 2
 #define PN_LAYOUT_TOP_ONLY 3
 PN_API void pn_window_set_layout(pn_window* window, int layout);
+/* how the screens are shown, improvements off by default (0, 0): filter 0 bilinear, 1 nearest, 2 sharp bilinear;
+   effects, or'ed: PN_EFFECT_FXAA (edges smoothed), PN_EFFECT_SHARPEN, PN_EFFECT_LCD_COLORS (the 3DS screen's
+   colors), PN_EFFECT_SCANLINES */
+enum { PN_EFFECT_FXAA = 1, PN_EFFECT_SHARPEN = 2, PN_EFFECT_LCD_COLORS = 4, PN_EFFECT_SCANLINES = 8 };
+PN_API void pn_window_set_filter(pn_window* window, uint32_t filter, uint32_t effects);
+/* a window with no window: what one at that scale would show (layout, filter, effects), saved by
+   pn_window_shot as a PPM picture, to check the screens' look with no window on the screen */
+PN_API pn_window* pn_offscreen_open(pn_engine* engine, uint32_t scale);
+PN_API int pn_window_shot(pn_window* window, const pn_screen screens[2], const char* path);
+/* the top screen in 3D, when the game draws both eyes: 0 off (the left eye, as before), 1 anaglyph red and cyan,
+   2 side by side (each eye half as wide, for 3D televisions and headsets) */
+PN_API void pn_window_set_stereo(pn_window* window, int mode);
 /* the inputs the last pn_window_poll read, for code that reads them on its
    own (a game's platform layer finding this export at run time); 0 before
    any window polled */
