@@ -88,6 +88,11 @@ PN_API void pn_set_resolution_scale(pn_engine* engine, uint32_t scale);
    translated while the game runs. 0 with the reason in error, for a missing
    file or one another build of picanative made. */
 PN_API int pn_load_shaders(pn_engine* engine, const char* path, char* error, uint32_t error_size);
+/* the pipelines the game made in its earlier runs, kept in this file, made again now on Dawn's threads (from its
+   disk cache); the new ones are added to it. Returns how many were started. */
+PN_API uint32_t pn_warm_pipelines(pn_engine* engine, const char* path);
+/* to stdout: pipelines made ahead, textures read from color buffers on the GPU, write-backs merged */
+PN_API void pn_print_stats(pn_engine* engine);
 /* vertex programs loaded ahead, translated while running (each logged), and
    the microseconds those translations took */
 PN_API void pn_shader_stats(pn_engine* engine, uint64_t out[3]);

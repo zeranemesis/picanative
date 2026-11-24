@@ -90,6 +90,9 @@ public:
     uint64_t tex_calls = 0, textures_updated = 0; // updated: in part, in place
     double submit_buffers = 0, submit_draws = 0; // of encoding: the buffers made, the draws encoded
     uint64_t submit_bytes = 0, arena_bytes = 0, lut_bytes = 0;
+    uint64_t pipelines_warmed = 0;
+    uint64_t gpu_tiled_transfers = 0; // tiled to tiled transfers done on the GPU, into a color buffer
+    uint64_t textures_from_buffers = 0, rtt_seen[5] = {}; // render to texture, read from the GPU (seen: by format) // made again at the start from the game's earlier runs
     uint64_t stores_merged = 0; // write-backs over bytes the game had changed since (kept)
   };
   const Stats& stats() const { return stats_; }
@@ -102,6 +105,10 @@ public:
   // Vertex programs translated ahead of time (shadergen::save_translations):
   // those are not translated again; any other the game runs is, and logged.
   bool load_translations(const std::string& path, std::string& error);
+  // the pipelines a game made in its earlier runs (their recipes in this file), made again now on Dawn's threads
+  // (from its disk cache: milliseconds each), and the new ones added to the file: a pipeline is never made in the
+  // middle of the game twice. Returns how many were started.
+  size_t warm_pipelines(const std::string& path);
 
   // the first WGSL compile errors, for diagnosis
   std::vector<std::string> errors;
@@ -122,6 +129,9 @@ private:
   void write_back(uint32_t address, uint32_t size, bool forget);
   void forget_textures(uint32_t address, uint32_t size);
   // a display transfer done on the GPU, when its input is a surface it holds
+  bool gpu_tiled_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
+                          uint32_t flags);
+  wgpu::ComputePipeline tiled_pipeline_;
   bool gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
                     uint32_t flags);
   // memory gets the GPU transfers on their way into a range (all of them with
@@ -146,6 +156,17 @@ private:
   uint32_t scale_ = 1;
   std::set<std::string> compiling_;
   std::vector<wgpu::Future> futures_;
+  std::unordered_map<std::string, wgpu::Future> warming_; // pipelines on Dawn's threads, by key
+  // what makes a pipeline, as kept in the recipes' file: its sources and its fixed-function state
+  struct Recipe {
+    std::string id, vertex, fragment;
+    std::vector<uint32_t> state; // cull, front, mask, blending (on, 6), depth (write, compare), stencil (on, 6)
+  };
+  struct Described;
+  wgpu::RenderPipelineDescriptor* describe(const Recipe& recipe, Described& out);
+  void start_pipeline(const Recipe& recipe);
+  std::string recipes_path_;
+  std::set<std::string> recipes_known_;
   pica::CommandProcessor processor_;
   Stats stats_;
 

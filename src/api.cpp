@@ -97,6 +97,21 @@ void pn_times(pn_engine* e, double out[7]) {
   for (int i = 0; i < 7; ++i) out[i] = times[i];
 }
 
+void pn_print_stats(pn_engine* e) {
+  const auto& s = e->renderer->stats();
+  std::printf("[picanative] pipelines made ahead %llu; textures read from color buffers on the GPU %llu (seen by format "
+              "RGBA8 %llu, RGB8 %llu, RGB5A1 %llu, RGB565 %llu, RGBA4 %llu); write-backs merged %llu\n",
+              (unsigned long long)s.pipelines_warmed, (unsigned long long)s.textures_from_buffers,
+              (unsigned long long)s.rtt_seen[0], (unsigned long long)s.rtt_seen[1], (unsigned long long)s.rtt_seen[2],
+              (unsigned long long)s.rtt_seen[3], (unsigned long long)s.rtt_seen[4], (unsigned long long)s.stores_merged);
+  std::printf("[picanative] tiled transfers on the GPU %llu\n", (unsigned long long)s.gpu_tiled_transfers);
+  std::fflush(stdout);
+}
+
+uint32_t pn_warm_pipelines(pn_engine* e, const char* path) {
+  return static_cast<uint32_t>(e->renderer->warm_pipelines(path));
+}
+
 int pn_load_shaders(pn_engine* e, const char* path, char* error, uint32_t error_size) {
   std::string message;
   if (e->renderer->load_translations(path, message)) return 1;
