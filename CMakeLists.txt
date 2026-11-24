@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.25)
 project(picanative LANGUAGES CXX)
+# symbols beside the optimized binaries (.pdb): profilers and crash reports name the functions
+if (MSVC)
+  add_compile_options(/Zi)
+  add_link_options(/DEBUG /OPT:REF /OPT:ICF)
+endif ()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
