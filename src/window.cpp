@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <ctime>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -194,6 +196,7 @@ struct pn_window {
   int layout = PN_LAYOUT_STACKED;
   uint32_t filter = 0, effects = 0; // pn_window_set_filter
   int stereo = 0;                    // pn_window_set_stereo
+  bool shot_asked = false;           // F12
   wgpu::RenderPipeline picture_masked[2], memory_masked[2]; // red alone, green and blue: an anaglyph's eyes
   struct Rect {
     float x, y, w, h;
@@ -450,6 +453,7 @@ void pn_window_close(pn_window* w) {
 }
 
 static void compose(pn_window* w, const pn_screen screens[2], const wgpu::Texture* target);
+int pn_window_shot(pn_window* w, const pn_screen screens[2], const char* path);
 
 void pn_window_present(pn_window* w, const pn_screen screens[2]) {
   if (!w->surface) return; // in the background (Android): no window to draw into
@@ -468,6 +472,20 @@ void pn_window_present(pn_window* w, const pn_screen screens[2]) {
   }
   compose(w, screens, &frame.texture);
   w->surface.Present();
+  // F12: what the window shows, at its size, into PN_SCREENSHOT_DIR (or Pictures/ctrnative), a BMP by the time
+  if (w->shot_asked) {
+    w->shot_asked = false;
+    std::filesystem::path dir;
+    if (const char* d = std::getenv("PN_SCREENSHOT_DIR")) dir = d;
+    else if (const char* home = std::getenv("USERPROFILE")) dir = std::filesystem::path(home) / "Pictures" / "ctrnative";
+    else dir = "screenshots";
+    std::error_code ignored;
+    std::filesystem::create_directories(dir, ignored);
+    char name[64];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(name, sizeof name, "%Y-%m-%d_%H-%M-%S.bmp", std::localtime(&now));
+    pn_window_shot(w, screens, (dir / name).string().c_str());
+  }
 }
 
 // the screens drawn into the window's frame, or into a picture (an offscreen window: no second display)
@@ -645,11 +663,38 @@ int pn_window_shot(pn_window* w, const pn_screen screens[2], const char* path) {
                              [&](wgpu::MapAsyncStatus status, wgpu::StringView) { mapped = status == wgpu::MapAsyncStatus::Success; }));
   if (!mapped) return 0;
   const auto* bytes = static_cast<const uint8_t*>(back.GetConstMappedRange(0, bd.size));
+  // the target's order: a window's surface is often BGRA
+  const bool bgra = td.format == wgpu::TextureFormat::BGRA8Unorm || td.format == wgpu::TextureFormat::BGRA8UnormSrgb;
+  const std::string name = path;
+  const bool bmp = name.size() > 4 && (name.substr(name.size() - 4) == ".bmp" || name.substr(name.size() - 4) == ".BMP");
   std::FILE* f = std::fopen(path, "wb");
   if (f) {
-    std::fprintf(f, "P6\n%u %u\n255\n", td.size.width, td.size.height);
-    for (uint32_t y = 0; y < td.size.height; ++y)
-      for (uint32_t x = 0; x < td.size.width; ++x) std::fwrite(bytes + size_t{y} * row + x * 4, 1, 3, f);
+    const uint32_t w_px = td.size.width, h_px = td.size.height;
+    if (bmp) {
+      const uint32_t line = (w_px * 3 + 3) & ~3u, data = line * h_px;
+      uint8_t header[54] = {'B', 'M'};
+      auto put = [&](int at, uint32_t v) { for (int k = 0; k < 4; ++k) header[at + k] = static_cast<uint8_t>(v >> (8 * k)); };
+      put(2, 54 + data), put(10, 54), put(14, 40), put(18, w_px), put(22, h_px);
+      header[26] = 1, header[28] = 24;
+      put(34, data);
+      std::fwrite(header, 1, 54, f);
+      std::vector<uint8_t> out(line, 0);
+      for (uint32_t y = h_px; y-- > 0;) { // bottom up
+        for (uint32_t x = 0; x < w_px; ++x) {
+          const uint8_t* p = bytes + size_t{y} * row + x * 4;
+          out[x * 3] = bgra ? p[0] : p[2], out[x * 3 + 1] = p[1], out[x * 3 + 2] = bgra ? p[2] : p[0];
+        }
+        std::fwrite(out.data(), 1, line, f);
+      }
+    } else {
+      std::fprintf(f, "P6\n%u %u\n255\n", w_px, h_px);
+      for (uint32_t y = 0; y < h_px; ++y)
+        for (uint32_t x = 0; x < w_px; ++x) {
+          const uint8_t* p = bytes + size_t{y} * row + x * 4;
+          const uint8_t rgb[3] = {bgra ? p[2] : p[0], p[1], bgra ? p[0] : p[2]};
+          std::fwrite(rgb, 1, 3, f);
+        }
+    }
     std::fclose(f);
   }
   back.Unmap();
@@ -665,8 +710,9 @@ int pn_window_poll(pn_window* w, pn_input* input) {
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED: open = false; break;
     case SDL_EVENT_KEY_DOWN:
       if (event.key.key == SDLK_ESCAPE) open = false;
-      // F10: the next layout; F11 or Alt+Enter: full screen
+      // F10: the next layout; F11 or Alt+Enter: full screen; F12: a screenshot of the window
       if (event.key.key == SDLK_F10 && !event.key.repeat) w->layout = (w->layout + 1) % 4;
+      if (event.key.key == SDLK_F12 && !event.key.repeat) w->shot_asked = true;
       if ((event.key.key == SDLK_F11 || (event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT))) &&
           !event.key.repeat) {
         w->fullscreen = !w->fullscreen;
