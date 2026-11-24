@@ -1089,6 +1089,13 @@ wgpu::RenderPipeline Renderer::pipeline(const draw::Config& c, const pica::Shade
 void Renderer::record(const pica::State& state, bool indexed, const std::vector<pica::CommandProcessor::Vertex>* immediate) {
   ++stats_.draws;
   Timed timed{stats_.record};
+  // the lookup tables' buffer could not take one more set: the draws so far sent with it, then it starts over
+  // (checked here, before this draw puts anything in the submit: Koopa Cape added more sets in one submit than
+  // the buffer holds, the write overflowed and the GPU device was lost)
+  if (luts_.size() + 2 * (24 * 256 + 128) > kLutCapacity) {
+    if (!pending_.empty()) flush(false);
+    luts_.clear(), luts_known_.clear(), luts_uploaded_ = 0, last_luts_at_ = UINT32_MAX;
+  }
   const auto& r = state.regs;
   // the color and depth buffers the draw renders into
   const uint32_t dims = r[0x11E], width = dims & 0x7FF, height = (dims >> 12 & 0x3FF) + 1;
