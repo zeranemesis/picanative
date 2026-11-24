@@ -246,6 +246,11 @@ struct Renderer::Surface {
   std::vector<uint8_t> before;
   bool pending = false; // told to on_pending
   wgpu::TextureView view; // to sample it as a texture (render to texture), made at the first such use
+  uint64_t version = 0;    // drawn into: one more (a depth buffer read as a color texture is made again)
+  // a D24S8 depth buffer read as an RGBA8 texture: its words as the console's memory has them, on the GPU
+  wgpu::Texture as_color;
+  wgpu::TextureView as_color_view;
+  uint64_t as_color_version = ~0ull;
 };
 
 struct Renderer::Texture {
@@ -411,6 +416,7 @@ Renderer::Surface& Renderer::surface(uint32_t address, uint32_t width, uint32_t 
     td.format = depth ? wgpu::TextureFormat::Depth32FloatStencil8 : wgpu::TextureFormat::RGBA8Unorm;
     td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
     if (!depth) td.usage |= wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::StorageBinding; // GPU transfers
+    else td.usage |= wgpu::TextureUsage::TextureBinding; // read as a color texture (depth_as_color)
     slot->texture = gpu_.device.CreateTexture(&td);
   }
   return *slot;
@@ -687,9 +693,30 @@ wgpu::TextureView Renderer::texture(const pica::State& state, int unit, uint32_t
       if (!s->view) s->view = s->texture.CreateView();
       return s->view;
     }
+    // a D24S8 depth buffer read as RGBA8 (Pokemon's effects): its words made on the GPU as memory would hold them
+    if (format == 0)
+      for (auto& [key, s] : surfaces_)
+        if (s->depth && s->depth_format == 3 && s->address == address && s->width == width && s->height == height &&
+            (s->drawn || s->loaded)) {
+          ++stats_.textures_from_depth;
+          return depth_as_color(*s);
+        }
   }
   uint32_t bytes = 0;
   for (uint32_t l = 0; l < levels; ++l) bytes += texture::size(format, std::max(width >> l, 1u), std::max(height >> l, 1u));
+  // PN_RTT_LOG=1: textures over a drawn color buffer the fast way above did not take (the first 40 kinds)
+  static const bool rtt_log = std::getenv("PN_RTT_LOG") != nullptr;
+  if (rtt_log)
+    for (auto& [key, s] : surfaces_)
+      if (s->drawn && address < s->address + s->bytes() && s->address < address + bytes) {
+        static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>> told;
+        const auto kind = std::tuple{width, height, format, levels, s->width, s->height,
+                                     static_cast<uint32_t>(s->format) | (s->depth ? 0x100u : 0u) | (address - s->address) << 12};
+        if (told.size() < 40 && told.insert(kind).second)
+          std::fprintf(stderr, "[picanative] texture %08x %ux%u format %u levels %u over a drawn %s buffer %08x %ux%u format %u\n",
+                       address, width, height, format, levels, s->depth ? "depth" : "color", s->address, s->width, s->height,
+                       s->depth ? s->depth_format : static_cast<uint32_t>(s->format));
+      }
   // drawn into in this command list: memory has to get it first
   {
     Timed t{stats_.tex_writeback};
@@ -1204,6 +1231,7 @@ void Renderer::record(const pica::State& state, bool indexed, const std::vector<
   if (!color.drawn) forget_textures(color.address, color.bytes()), remember(color);
   if (!depth.drawn) forget_textures(depth.address, depth.bytes()), remember(depth);
   color.drawn = depth.drawn = true;
+  ++color.version, ++depth.version;
   d.color = &color;
   d.depth = &depth;
   pending_.push_back(d);
@@ -1507,6 +1535,7 @@ void Renderer::memory_fill(uint32_t start, uint32_t end, uint32_t value, uint32_
       pending_.push_back(clear);
       if (!s->drawn) remember(*s);
       s->loaded = s->drawn = true;
+      ++s->version;
       forget_textures(start, end - start);
       return;
     }
@@ -1552,6 +1581,61 @@ void Renderer::display_transfer(uint32_t input, uint32_t output, uint32_t input_
   }
   picanative::display_transfer(memory_, input, output, input_dimensions, output_dimensions, flags);
   forget_textures(output, output_bytes);
+}
+
+wgpu::TextureView Renderer::depth_as_color(Surface& s) {
+  if (s.as_color && s.as_color_version == s.version) return s.as_color_view;
+  if (!depth_color_pipeline_) {
+    static const char* source = R"(
+@group(0) @binding(0) var depth: texture_depth_2d;
+@group(0) @binding(1) var stencil: texture_2d<u32>;
+@group(0) @binding(2) var dst: texture_storage_2d<rgba8unorm, write>;
+@compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let size = textureDimensions(dst);
+  if (id.x >= size.x || id.y >= size.y) { return; }
+  let p = vec2<u32>(id.xy);
+  // as Renderer::store writes it: 24 bits of depth, the stencil above; an RGBA8 texel reads that word's
+  // bytes 3, 2, 1, 0 as red, green, blue, alpha
+  let d = u32(clamp(textureLoad(depth, p, 0), 0.0, 1.0) * 16777215.0);
+  let st = textureLoad(stencil, p, 0).r & 0xFFu;
+  textureStore(dst, p, vec4<f32>(f32(st), f32((d >> 16u) & 0xFFu), f32((d >> 8u) & 0xFFu), f32(d & 0xFFu)) / 255.0);
+}
+)";
+    wgpu::ComputePipelineDescriptor cd{};
+    cd.compute.module = module(gpu_, source);
+    cd.compute.entryPoint = "main";
+    depth_color_pipeline_ = gpu_.device.CreateComputePipeline(&cd);
+  }
+  if (!s.as_color) {
+    wgpu::TextureDescriptor td{};
+    td.size = {s.width * scale_, s.height * scale_, 1};
+    td.format = wgpu::TextureFormat::RGBA8Unorm;
+    td.usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::StorageBinding;
+    s.as_color = gpu_.device.CreateTexture(&td);
+    s.as_color_view = s.as_color.CreateView();
+  }
+  submit({}); // the draws into the depth buffer first
+  wgpu::TextureViewDescriptor depth_view{}, stencil_view{};
+  depth_view.aspect = wgpu::TextureAspect::DepthOnly;
+  stencil_view.aspect = wgpu::TextureAspect::StencilOnly;
+  wgpu::BindGroupEntry e[3] = {};
+  e[0].binding = 0, e[0].textureView = s.texture.CreateView(&depth_view);
+  e[1].binding = 1, e[1].textureView = s.texture.CreateView(&stencil_view);
+  e[2].binding = 2, e[2].textureView = s.as_color_view;
+  wgpu::BindGroupDescriptor group{};
+  group.layout = depth_color_pipeline_.GetBindGroupLayout(0);
+  group.entryCount = 3;
+  group.entries = e;
+  const wgpu::CommandEncoder encoder = gpu_.device.CreateCommandEncoder();
+  const wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
+  pass.SetPipeline(depth_color_pipeline_);
+  pass.SetBindGroup(0, gpu_.device.CreateBindGroup(&group));
+  pass.DispatchWorkgroups((s.width * scale_ + 7) / 8, (s.height * scale_ + 7) / 8);
+  pass.End();
+  const wgpu::CommandBuffer commands = encoder.Finish();
+  gpu_.queue.Submit(1, &commands);
+  s.as_color_version = s.version;
+  return s.as_color_view;
 }
 
 bool Renderer::gpu_tiled_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions,

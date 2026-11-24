@@ -91,7 +91,8 @@ public:
     double submit_buffers = 0, submit_draws = 0; // of encoding: the buffers made, the draws encoded
     uint64_t submit_bytes = 0, arena_bytes = 0, lut_bytes = 0;
     uint64_t pipelines_warmed = 0;
-    uint64_t gpu_tiled_transfers = 0; // tiled to tiled transfers done on the GPU, into a color buffer
+    uint64_t gpu_tiled_transfers = 0;
+    uint64_t textures_from_depth = 0; // depth buffers read as color textures, converted on the GPU // tiled to tiled transfers done on the GPU, into a color buffer
     uint64_t textures_from_buffers = 0, rtt_seen[5] = {}; // render to texture, read from the GPU (seen: by format) // made again at the start from the game's earlier runs
     uint64_t stores_merged = 0; // write-backs over bytes the game had changed since (kept)
   };
@@ -132,6 +133,8 @@ private:
   bool gpu_tiled_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
                           uint32_t flags);
   wgpu::ComputePipeline tiled_pipeline_;
+  wgpu::ComputePipeline depth_color_pipeline_;
+  wgpu::TextureView depth_as_color(Surface& s);
   bool gpu_transfer(uint32_t input, uint32_t output, uint32_t input_dimensions, uint32_t output_dimensions,
                     uint32_t flags);
   // memory gets the GPU transfers on their way into a range (all of them with
