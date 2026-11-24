@@ -164,6 +164,15 @@ PN_API void pn_window_set_vsync(pn_window* window, int on);
 #define PN_LAYOUT_LARGE_TOP 2
 #define PN_LAYOUT_TOP_ONLY 3
 PN_API void pn_window_set_layout(pn_window* window, int layout);
+/* how the screens are shown, improvements off by default (0, 0): filter 0 bilinear, 1 nearest, 2 sharp bilinear;
+   effects, or'ed: PN_EFFECT_FXAA (edges smoothed), PN_EFFECT_SHARPEN, PN_EFFECT_LCD_COLORS (the 3DS screen's
+   colors), PN_EFFECT_SCANLINES */
+enum { PN_EFFECT_FXAA = 1, PN_EFFECT_SHARPEN = 2, PN_EFFECT_LCD_COLORS = 4, PN_EFFECT_SCANLINES = 8 };
+PN_API void pn_window_set_filter(pn_window* window, uint32_t filter, uint32_t effects);
+/* a window with no window: what one at that scale would show (layout, filter, effects), saved by
+   pn_window_shot as a PPM picture, to check the screens' look with no window on the screen */
+PN_API pn_window* pn_offscreen_open(pn_engine* engine, uint32_t scale);
+PN_API int pn_window_shot(pn_window* window, const pn_screen screens[2], const char* path);
 /* the inputs the last pn_window_poll read, for code that reads them on its
    own (a game's platform layer finding this export at run time); 0 before
    any window polled */
