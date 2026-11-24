@@ -79,7 +79,7 @@ PN_API void pn_geometry_uniforms(pn_engine* engine, uint32_t first, const uint32
 #define PN_ASYNC_PIPELINES 4u
 PN_API pn_engine* pn_create_ex(pn_map_fn map, void* user, uint32_t flags, char* error, uint32_t error_size);
 /* draws at this many times the console's resolution (1 to 8; 1, the default,
-   is the console's pixels exactly); before the first command list. Memory
+   is the console's pixels exactly); during a game too, after a short reload. Memory
    always gets the console's pixels; the window shows the scaled pictures. */
 PN_API void pn_set_resolution_scale(pn_engine* engine, uint32_t scale);
 /* the texture improvements, off by default (PN_ANISOTROPY, PN_MIPMAPS set them at the start): anisotropic

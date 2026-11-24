@@ -1591,6 +1591,21 @@ void Renderer::write_back(uint32_t address, uint32_t size, bool forget) {
   if (!back.empty()) submit(back);
 }
 
+void Renderer::set_scale(uint32_t scale) {
+  scale = std::max(1u, std::min(scale, 8u));
+  if (scale == scale_) return;
+  if (!surfaces_.empty()) { // a game going: memory gets everything first, then nothing at the old scale is kept
+    deliver();
+    flush(true);
+    deliver();
+    for (auto& [key, s] : surfaces_)
+      if (s->pending && on_pending) s->pending = false, on_pending(s->address, s->bytes(), false);
+    surfaces_.clear(), pictures_.clear();
+    texture_groups_.clear(), known_.clear(), previous_.clear(), textures_.clear(); // render to texture: views of them
+  }
+  scale_ = scale;
+}
+
 // the texture improvements changed during a game: samplers and textures made again as they are next used (their
 // pipelines too, anisotropy being part of a pipeline's recipe)
 void Renderer::set_texture_options(int anisotropy, bool mipmaps) {

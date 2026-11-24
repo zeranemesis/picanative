@@ -69,11 +69,11 @@ public:
   wgpu::TextureView picture_view(uint32_t address, bool& flip) const;
 
   // draws at this many times the console's resolution (1, the default:
-  // exactly the console's pixels); to set before the first command list.
+  // exactly the console's pixels).
   // Memory always gets the console's pixels (one sample per block).
-  void set_scale(uint32_t scale) {
-    if (surfaces_.empty()) scale_ = std::max(1u, std::min(scale, 8u));
-  }
+  // during a game too: what the GPU holds goes back to memory, the surfaces are made again at the new scale as the
+  // game draws (a short reload)
+  void set_scale(uint32_t scale);
   uint32_t scale() const { return scale_; }
   void set_texture_options(int anisotropy, bool mipmaps);
   gpu::Context& gpu() { return gpu_; }
